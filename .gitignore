@@ -1,0 +1,10 @@
+venv/
+.venv-build/
+__pycache__/
+*.pyc
+
+# Saídas de build
+build/
+dist/
+release/
+_build_info.py

@@ -1,0 +1,41 @@
+name: Release
+
+# Publicar uma tag vX.Y.Z compila o instalador e cria a Release do GitHub,
+# que é exatamente de onde o atualizador do app busca novas versões.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compilar instalador
+        shell: pwsh
+        run: ./build_windows.ps1 -Version "${{ github.ref_name }}" -Repo "${{ github.repository }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TTSReader-Setup
+          path: |
+            release/TTSReader-Setup.exe
+            release/TTSReader-Setup.exe.sha256
+
+      - name: Publicar release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/TTSReader-Setup.exe
+            release/TTSReader-Setup.exe.sha256
+          generate_release_notes: true
