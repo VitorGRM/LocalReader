@@ -34,6 +34,10 @@ Execute com `./run.sh`.
 
 O app é distribuído como instalador (`TTSReader-Setup.exe`), com o Tesseract e os idiomas pt/en/es/fr/de/it embutidos. A instalação é por usuário, sem precisar de administrador. Para o OCR com idiomas extras, copie os arquivos `.traineddata` para `tesseract\tessdata` dentro da pasta de instalação. A criação de PDF pesquisável (OCRmyPDF) não vem embutida e fica desativada no `.exe`.
 
+### Tempo de leitura
+
+No painel de leitura, o app mostra o tempo restante até o fim do documento e o horário previsto de término. A estimativa parte do tamanho do texto e se ajusta à velocidade real da voz conforme a leitura avança.
+
 ### Tema
 
 **Exibir → Tema** alterna entre Automático (segue o Windows), Claro e Escuro.

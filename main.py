@@ -9,10 +9,12 @@ cima/baixo (ou os botões) para navegar entre períodos. A segunda aba extrai
 texto de PDFs e imagens e pode enviá-lo diretamente para o leitor.
 """
 import asyncio
+import os
 import re
 import sys
 import time
 import traceback
+from datetime import datetime, timedelta
 
 from PyQt6.QtCore import Qt, QObject, QSettings, QThread, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QAction, QActionGroup, QFont, QTextCharFormat, QTextCursor
@@ -46,6 +48,7 @@ from audio_keepalive import AudioKeepAlive
 from document_loader import load_document
 from ocr_widget import OCRWidget
 from platform_support import is_frozen, setup_bundled_tools
+from reading_time import ReadingTimeEstimator, format_duration
 from sentence_split import split_sentences
 from theme import MODE_LABELS, MODES, ThemeManager
 from tts_engines import ENGINE_ORDER, ENGINES, TTSEngine, VoiceInfo
@@ -55,6 +58,7 @@ from update_ui import UpdateManager
 PREFETCH_AHEAD = 3
 UPDATE_CHECK_DELAY_MS = 3000
 SENTENCE_END_DELAY_MS = 250
+TIME_UPDATE_INTERVAL_S = 0.5
 KEEP_AUDIO_KEY = "keep_audio_open"
 SIDEBAR_WIDTH = 340
 SCROLL_TOP_MARGIN = 24
@@ -218,6 +222,9 @@ class MainWindow(QMainWindow):
         self.log_manager = log_manager
         self.theme = theme
         self.log_dialog: LogViewerDialog | None = None
+        self.estimator = ReadingTimeEstimator(gap_ms=SENTENCE_END_DELAY_MS)
+        self._playing_index: int | None = None  # período cujo áudio está no player
+        self._last_time_update = 0.0
         self.settings = QSettings("LocalReader", "TTSReader")
         self._keep_audio_open = self.settings.value(KEEP_AUDIO_KEY, True, type=bool)
         self.audio_keepalive = AudioKeepAlive(self.log_manager.log, self)
@@ -428,8 +435,18 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(0)
         self.position_label = QLabel("Período 0 / 0")
         self.position_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.time_label = QLabel("⏱ Restante: --:--")
+        self.time_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.time_label.setToolTip(
+            "Estimativa a partir do tamanho do texto; ela se ajusta à velocidade real "
+            "da voz conforme a leitura avança."
+        )
+        self.eta_label = QLabel("")
+        self.eta_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         player_layout.addWidget(self.progress_bar)
         player_layout.addWidget(self.position_label)
+        player_layout.addWidget(self.time_label)
+        player_layout.addWidget(self.eta_label)
 
         layout.addWidget(player_group)
 
@@ -469,6 +486,7 @@ class MainWindow(QMainWindow):
         self.audio_output = QAudioOutput()
         self.player.setAudioOutput(self.audio_output)
         self.player.mediaStatusChanged.connect(self._on_media_status_changed)
+        self.player.positionChanged.connect(self._on_position_changed)
         self.player.errorOccurred.connect(self._on_player_error)
 
     # ---------- Logs ----------
@@ -636,6 +654,11 @@ class MainWindow(QMainWindow):
                 pass
             self.pipeline.shutdown()
 
+        # Voz, velocidade ou texto novos: as durações medidas até aqui não valem mais.
+        self.estimator.reset([len(text.strip()) for text, _, _ in self.sentences], self.rate_slider.value())
+        self._playing_index = None
+        self._update_time_display()
+
         engine = self._current_engine()
         voice_id = self.voice_combo.currentData()
         if engine is None or not voice_id:
@@ -702,12 +725,50 @@ class MainWindow(QMainWindow):
 
     def _play_path(self, path: str):
         self.player.stop()
+        self._playing_index = self.current_index
         self.player.setSource(QUrl.fromLocalFile(path))
         self.player.play()
         self.status_label.setText(f"Lendo período {self.current_index + 1} de {len(self.sentences)}")
         self._update_play_button_label()
 
+    def _record_loaded_duration(self):
+        """Guarda a duração real do áudio carregado para refinar a estimativa."""
+        index = self._playing_index
+        duration = self.player.duration()
+        if index is None or duration <= 0:
+            return
+        loaded_file = os.path.basename(self.player.source().toLocalFile())
+        if loaded_file.startswith(f"{index:06d}"):  # garante que o áudio é mesmo deste período
+            self.estimator.record_duration(index, duration)
+            self._update_time_display()
+
+    def _on_position_changed(self, _position: int):
+        if time.monotonic() - self._last_time_update >= TIME_UPDATE_INTERVAL_S:
+            self._update_time_display()
+
+    def _update_time_display(self):
+        self._last_time_update = time.monotonic()
+        if self.current_index < 0 or not self.sentences:
+            self.time_label.setText("⏱ Restante: --:--")
+            self.eta_label.setText("")
+            return
+        position = self.player.position() if self._playing_index == self.current_index else 0
+        remaining = self.estimator.remaining_ms(self.current_index, position)
+        total = self.estimator.total_ms()
+        self.time_label.setText(
+            f"⏱ Restante: {format_duration(remaining)} (de ~{format_duration(total)})"
+        )
+        if self.is_playing_intent:
+            now = datetime.now()
+            end = now + timedelta(milliseconds=remaining)
+            pattern = "%H:%M" if end.date() == now.date() else "%d/%m %H:%M"
+            self.eta_label.setText(f"Término previsto: {end.strftime(pattern)}")
+        else:
+            self.eta_label.setText("Término previsto: ao iniciar a leitura")
+
     def _on_media_status_changed(self, status):
+        if status in (QMediaPlayer.MediaStatus.LoadedMedia, QMediaPlayer.MediaStatus.BufferedMedia):
+            self._record_loaded_duration()
         if status == QMediaPlayer.MediaStatus.EndOfMedia and self.is_playing_intent:
             # O Qt pode avisar o fim antes do áudio terminar de sair pelo alto-falante;
             # trocar de período na hora cortaria o final da frase.
@@ -747,6 +808,7 @@ class MainWindow(QMainWindow):
             self.play_pause_btn.setText("⏸ Pause")
         else:
             self.play_pause_btn.setText("▶ Play")
+        self._update_time_display()
 
     # ---------- Navigation ----------
     def _go_next(self):
@@ -834,6 +896,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.setMaximum(max(total, 1))
         self.progress_bar.setValue(idx)
         self.position_label.setText(f"Período {idx} / {total}")
+        self._update_time_display()
 
     def closeEvent(self, event):
         self.is_playing_intent = False

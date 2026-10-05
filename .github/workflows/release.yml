@@ -25,7 +25,7 @@ jobs:
         run: |
           python -m compileall -q .
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          python -m unittest test_updater -v
+          python -m unittest test_updater test_reading_time -v
 
       - name: Compilar instalador
         shell: pwsh
