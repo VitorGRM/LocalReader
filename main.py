@@ -14,7 +14,7 @@ import sys
 import time
 import traceback
 
-from PyQt6.QtCore import Qt, QObject, QThread, QTimer, QUrl, pyqtSignal
+from PyQt6.QtCore import Qt, QObject, QSettings, QThread, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QAction, QActionGroup, QFont, QTextCharFormat, QTextCursor
 from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PyQt6.QtWidgets import (
@@ -42,6 +42,7 @@ from PyQt6.QtWidgets import (
 )
 
 from app_version import GITHUB_REPO, __version__
+from audio_keepalive import AudioKeepAlive
 from document_loader import load_document
 from ocr_widget import OCRWidget
 from platform_support import is_frozen, setup_bundled_tools
@@ -53,6 +54,8 @@ from update_ui import UpdateManager
 
 PREFETCH_AHEAD = 3
 UPDATE_CHECK_DELAY_MS = 3000
+SENTENCE_END_DELAY_MS = 250
+KEEP_AUDIO_KEY = "keep_audio_open"
 SIDEBAR_WIDTH = 340
 SCROLL_TOP_MARGIN = 24
 
@@ -215,6 +218,9 @@ class MainWindow(QMainWindow):
         self.log_manager = log_manager
         self.theme = theme
         self.log_dialog: LogViewerDialog | None = None
+        self.settings = QSettings("LocalReader", "TTSReader")
+        self._keep_audio_open = self.settings.value(KEEP_AUDIO_KEY, True, type=bool)
+        self.audio_keepalive = AudioKeepAlive(self.log_manager.log, self)
 
         self.setWindowTitle("TTS Reader — voz neural e OCR adaptativo")
         self.resize(1280, 800)
@@ -235,6 +241,7 @@ class MainWindow(QMainWindow):
         self.theme.changed.connect(self._apply_theme)
         self._apply_theme()
         self._on_engine_changed()
+        self.audio_keepalive.set_enabled(self._keep_audio_open)
 
         self.update_manager = UpdateManager(self, self.log_manager.log)
         if is_frozen():
@@ -242,7 +249,8 @@ class MainWindow(QMainWindow):
 
     # ---------- Menu ----------
     def _build_menu(self):
-        theme_menu = self.menuBar().addMenu("&Exibir").addMenu("&Tema")
+        view_menu = self.menuBar().addMenu("&Exibir")
+        theme_menu = view_menu.addMenu("&Tema")
         theme_group = QActionGroup(self)
         theme_group.setExclusive(True)
         for mode in MODES:
@@ -253,6 +261,13 @@ class MainWindow(QMainWindow):
             theme_group.addAction(action)
             theme_menu.addAction(action)
 
+        audio_menu = self.menuBar().addMenu("Á&udio")
+        keepalive_action = QAction("Manter saída de áudio ativa (evita som e corte entre períodos)", self)
+        keepalive_action.setCheckable(True)
+        keepalive_action.setChecked(self._keep_audio_open)
+        keepalive_action.toggled.connect(self._set_keep_audio_open)
+        audio_menu.addAction(keepalive_action)
+
         help_menu = self.menuBar().addMenu("&Ajuda")
         check_action = QAction("Verificar &atualizações...", self)
         check_action.triggered.connect(lambda: self.update_manager.check(silent=False))
@@ -261,6 +276,11 @@ class MainWindow(QMainWindow):
         help_menu.addAction(check_action)
         help_menu.addSeparator()
         help_menu.addAction(about_action)
+
+    def _set_keep_audio_open(self, enabled: bool):
+        self._keep_audio_open = enabled
+        self.settings.setValue(KEEP_AUDIO_KEY, enabled)
+        self.audio_keepalive.set_enabled(enabled)
 
     def _show_about(self):
         repo_line = f"\nRepositório: github.com/{GITHUB_REPO}" if GITHUB_REPO else ""
@@ -689,6 +709,13 @@ class MainWindow(QMainWindow):
 
     def _on_media_status_changed(self, status):
         if status == QMediaPlayer.MediaStatus.EndOfMedia and self.is_playing_intent:
+            # O Qt pode avisar o fim antes do áudio terminar de sair pelo alto-falante;
+            # trocar de período na hora cortaria o final da frase.
+            index = self.current_index
+            QTimer.singleShot(SENTENCE_END_DELAY_MS, lambda: self._advance_after_end(index))
+
+    def _advance_after_end(self, finished_index: int):
+        if self.is_playing_intent and self.current_index == finished_index:
             self._go_next()
 
     def _on_player_error(self, error, error_string: str):
@@ -811,6 +838,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self.is_playing_intent = False
         self.update_manager.shutdown()
+        self.audio_keepalive.set_enabled(False)
         self.ocr_widget.shutdown()
         if self.pipeline is not None:
             self.pipeline.shutdown()
