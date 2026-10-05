@@ -135,7 +135,6 @@ class OCRWidget(QWidget):
         self.open_button.clicked.connect(self._choose_source)
         self.source_label = QLabel("Nenhum arquivo selecionado")
         self.source_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.source_label.setStyleSheet("QLabel { padding: 6px; color: #444; }")
         source_row.addWidget(self.open_button)
         source_row.addWidget(self.source_label, 1)
         root.addLayout(source_row)
@@ -146,6 +145,13 @@ class OCRWidget(QWidget):
         splitter.setSizes([390, 850])
         splitter.setStretchFactor(1, 1)
         root.addWidget(splitter, 1)
+
+    def apply_theme(self, muted_color: str) -> None:
+        """Define a cor dos textos secundários conforme o tema (claro/escuro)."""
+        self.source_label.setStyleSheet(f"QLabel {{ padding: 6px; color: {muted_color}; }}")
+        small = f"color: {muted_color}; font-size: 11px;"
+        self.language_help.setStyleSheet(small)
+        self.language_status.setStyleSheet(small)
 
     def _build_options_panel(self) -> QWidget:
         scroll = QScrollArea()
@@ -187,7 +193,7 @@ class OCRWidget(QWidget):
             "Marque um ou mais modelos. Para maior precisão, selecione apenas os idiomas prováveis."
         )
         language_help.setWordWrap(True)
-        language_help.setStyleSheet("color: #555; font-size: 11px;")
+        self.language_help = language_help
         language_layout.addWidget(language_help)
         self.language_list = QListWidget()
         self.language_list.setMaximumHeight(165)
@@ -198,7 +204,6 @@ class OCRWidget(QWidget):
         language_layout.addWidget(refresh_button)
         self.language_status = QLabel()
         self.language_status.setWordWrap(True)
-        self.language_status.setStyleSheet("color: #555; font-size: 11px;")
         language_layout.addWidget(self.language_status)
         layout.addWidget(language_group)
 

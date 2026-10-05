@@ -34,6 +34,10 @@ Execute com `./run.sh`.
 
 O app é distribuído como instalador (`TTSReader-Setup.exe`), com o Tesseract e os idiomas pt/en/es/fr/de/it embutidos. A instalação é por usuário, sem precisar de administrador. Para o OCR com idiomas extras, copie os arquivos `.traineddata` para `tesseract\tessdata` dentro da pasta de instalação. A criação de PDF pesquisável (OCRmyPDF) não vem embutida e fica desativada no `.exe`.
 
+### Tema
+
+**Exibir → Tema** alterna entre Automático (segue o Windows), Claro e Escuro.
+
 ### Publicando uma versão
 
 1. Crie um repositório **público** no GitHub e envie este projeto.
@@ -44,7 +48,7 @@ O app é distribuído como instalador (`TTSReader-Setup.exe`), com o Tesseract e
    git push origin v1.0.0
    ```
 
-3. O workflow [`.github/workflows/release.yml`](.github/workflows/release.yml) compila o instalador no GitHub e cria a Release com `TTSReader-Setup.exe` e o `.sha256`.
+3. O workflow [`.github/workflows/release.yml`](.github/workflows/release.yml) compila o instalador no GitHub e cria a Release com `TTSReader-Setup.exe` e o `.sha256`. Se existir `release-notes/<tag>.md` (ex.: `release-notes/v1.1.0.md`), o texto vira as notas da release e aparece no aviso de atualização do app.
 
 Para lançar atualizações, repita com uma tag maior (`v1.0.1`, `v1.1.0`...). O repositório é preenchido automaticamente no build.
 

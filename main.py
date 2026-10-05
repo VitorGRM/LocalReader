@@ -15,7 +15,7 @@ import time
 import traceback
 
 from PyQt6.QtCore import Qt, QObject, QThread, QTimer, QUrl, pyqtSignal
-from PyQt6.QtGui import QAction, QColor, QFont, QTextCharFormat, QTextCursor
+from PyQt6.QtGui import QAction, QActionGroup, QFont, QTextCharFormat, QTextCursor
 from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PyQt6.QtWidgets import (
     QApplication,
@@ -46,13 +46,13 @@ from document_loader import load_document
 from ocr_widget import OCRWidget
 from platform_support import is_frozen, setup_bundled_tools
 from sentence_split import split_sentences
+from theme import MODE_LABELS, MODES, ThemeManager
 from tts_engines import ENGINE_ORDER, ENGINES, TTSEngine, VoiceInfo
 from tts_pipeline import SentencePipeline
 from update_ui import UpdateManager
 
 PREFETCH_AHEAD = 3
 UPDATE_CHECK_DELAY_MS = 3000
-HIGHLIGHT_COLOR = QColor("#ffe08a")
 SIDEBAR_WIDTH = 340
 SCROLL_TOP_MARGIN = 24
 
@@ -210,9 +210,10 @@ def parse_locale_name(locale_name: str, locale_code: str) -> tuple[str, str]:
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, log_manager: "LogManager"):
+    def __init__(self, log_manager: "LogManager", theme: ThemeManager):
         super().__init__()
         self.log_manager = log_manager
+        self.theme = theme
         self.log_dialog: LogViewerDialog | None = None
 
         self.setWindowTitle("TTS Reader — voz neural e OCR adaptativo")
@@ -231,6 +232,8 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._build_menu()
         self._setup_player()
+        self.theme.changed.connect(self._apply_theme)
+        self._apply_theme()
         self._on_engine_changed()
 
         self.update_manager = UpdateManager(self, self.log_manager.log)
@@ -239,6 +242,17 @@ class MainWindow(QMainWindow):
 
     # ---------- Menu ----------
     def _build_menu(self):
+        theme_menu = self.menuBar().addMenu("&Exibir").addMenu("&Tema")
+        theme_group = QActionGroup(self)
+        theme_group.setExclusive(True)
+        for mode in MODES:
+            action = QAction(MODE_LABELS[mode], self)
+            action.setCheckable(True)
+            action.setChecked(mode == self.theme.mode)
+            action.triggered.connect(lambda _checked, m=mode: self.theme.set_mode(m))
+            theme_group.addAction(action)
+            theme_menu.addAction(action)
+
         help_menu = self.menuBar().addMenu("&Ajuda")
         check_action = QAction("Verificar &atualizações...", self)
         check_action.triggered.connect(lambda: self.update_manager.check(silent=False))
@@ -319,10 +333,6 @@ class MainWindow(QMainWindow):
 
         self.engine_info_label = QLabel("")
         self.engine_info_label.setWordWrap(True)
-        self.engine_info_label.setStyleSheet(
-            "QLabel { color: #444; font-size: 11px; background-color: #f0f0f0; "
-            "border-radius: 4px; padding: 6px; }"
-        )
         voice_layout.addWidget(self.engine_info_label)
         voice_layout.addSpacing(6)
 
@@ -422,13 +432,17 @@ class MainWindow(QMainWindow):
         self.text_view.setReadOnly(True)
         self.text_view.setCursorWidth(0)
         self.text_view.setFont(QFont("Georgia", 14))
-        self.text_view.setStyleSheet(
-            "QTextEdit { background-color: #fffdf7; color: #2b2b2b; padding: 24px; }"
-        )
         self.text_view.navigate_prev.connect(self._go_previous)
         self.text_view.navigate_next.connect(self._go_next)
         self.text_view.toggle_play.connect(self._toggle_play_pause)
         return self.text_view
+
+    def _apply_theme(self):
+        """Reaplica as cores que não vêm da paleta (leitor, destaque, textos secundários)."""
+        self.text_view.setStyleSheet(self.theme.reader_stylesheet())
+        self.engine_info_label.setStyleSheet(self.theme.info_label_stylesheet())
+        self.ocr_widget.apply_theme(self.theme.muted_text_color())
+        self._highlight_current(scroll=False)
 
     def _setup_player(self):
         self.player = QMediaPlayer()
@@ -767,7 +781,7 @@ class MainWindow(QMainWindow):
         cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
 
         fmt = QTextCharFormat()
-        fmt.setBackground(HIGHLIGHT_COLOR)
+        fmt.setBackground(self.theme.highlight_color)
         selection = QTextEdit.ExtraSelection()
         selection.format = fmt
         selection.cursor = cursor
@@ -809,10 +823,11 @@ class MainWindow(QMainWindow):
 def main():
     tools_dir = setup_bundled_tools()
     app = QApplication(sys.argv)
+    theme = ThemeManager(app)
     log_manager = LogManager()
     install_excepthook(log_manager)
     log_manager.log(f"TTS Reader {__version__} — Tesseract: {tools_dir or 'usando o PATH do sistema'}")
-    window = MainWindow(log_manager)
+    window = MainWindow(log_manager, theme)
     window.showMaximized()
     sys.exit(app.exec())
 

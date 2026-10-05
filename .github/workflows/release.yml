@@ -20,6 +20,13 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Checar sintaxe e testes
+        shell: pwsh
+        run: |
+          python -m compileall -q .
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          python -m unittest test_updater -v
+
       - name: Compilar instalador
         shell: pwsh
         run: ./build_windows.ps1 -Version "${{ github.ref_name }}" -Repo "${{ github.repository }}"
@@ -31,11 +38,16 @@ jobs:
             release/TTSReader-Setup.exe
             release/TTSReader-Setup.exe.sha256
 
+      # Se existir release-notes/<tag>.md, ele vira o texto da release (e aparece no
+      # aviso de atualização do app); senão o GitHub gera as notas sozinho.
       - name: Publicar release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
+        env:
+          NOTES: release-notes/${{ github.ref_name }}.md
         with:
           files: |
             release/TTSReader-Setup.exe
             release/TTSReader-Setup.exe.sha256
-          generate_release_notes: true
+          body_path: ${{ hashFiles(env.NOTES) != '' && env.NOTES || '' }}
+          generate_release_notes: ${{ hashFiles(env.NOTES) == '' }}
