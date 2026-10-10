@@ -36,6 +36,7 @@ from PyQt6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSlider,
     QTabWidget,
     QTextEdit,
@@ -209,6 +210,19 @@ class VoiceLoaderThread(QThread):
             self.failed.emit(str(exc))
 
 
+def summarize_error(message: str, engine_name: str = "", limit: int = 160) -> str:
+    """Resume um erro de síntese em uma frase curta para o rótulo de status.
+
+    As exceções de rede trazem URLs enormes e sem pontos de quebra; num QLabel
+    com quebra de linha isso alarga a barra lateral inteira e corta os botões.
+    """
+    if "403" in message and "Invalid response status" in message:
+        prefix = f"{engine_name}: " if engine_name else ""
+        return f"{prefix}o serviço de voz recusou o acesso (erro 403)."
+    first_line = " ".join(message.split())
+    return first_line if len(first_line) <= limit else first_line[: limit - 1] + "…"
+
+
 def parse_locale_name(locale_name: str, locale_code: str) -> tuple[str, str]:
     match = re.match(r"^(?P<lang>.*?)\s*\((?P<country>.*?)\)\s*$", locale_name or "")
     if match:
@@ -241,6 +255,7 @@ class MainWindow(QMainWindow):
         self.pipeline: SentencePipeline | None = None
         self._voice_threads: list[VoiceLoaderThread] = []
         self._engine_voices: dict[str, list[VoiceInfo]] = {}
+        self._engine_failure_notified: set[str] = set()
 
         self._build_ui()
         self._build_menu()
@@ -334,6 +349,7 @@ class MainWindow(QMainWindow):
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
         scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll_content = QWidget()
         layout = QVBoxLayout(scroll_content)
 
@@ -366,6 +382,10 @@ class MainWindow(QMainWindow):
         self.language_combo = QComboBox()
         self.country_combo = QComboBox()
         self.voice_combo = QComboBox()
+        for combo in (self.engine_combo, self.language_combo, self.country_combo, self.voice_combo):
+            # Nomes de voz longos não podem alargar a barra lateral.
+            combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            combo.setMinimumContentsLength(12)
         self.language_combo.currentIndexChanged.connect(self._on_language_changed)
         self.country_combo.currentIndexChanged.connect(self._on_country_changed)
         self.voice_combo.currentIndexChanged.connect(self._on_voice_params_changed)
@@ -452,6 +472,7 @@ class MainWindow(QMainWindow):
 
         self.status_label = QLabel("Carregando lista de vozes...")
         self.status_label.setWordWrap(True)
+        self.status_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         layout.addWidget(self.status_label)
 
         layout.addStretch(1)
@@ -706,10 +727,48 @@ class MainWindow(QMainWindow):
 
     def _on_sentence_failed(self, index: int, message: str):
         self.log_manager.log(f"Falha ao gerar período {index + 1}: {message}")
-        if index == self.current_index:
-            self.waiting_index = None
-            self.status_label.setText(f"Falha ao gerar período {index + 1}: {message}")
-            self._update_play_button_label()
+        if index != self.current_index:
+            return
+        was_waiting = self.waiting_index == index
+        self.waiting_index = None
+        engine = self._current_engine()
+        engine_name = engine.display_name if engine else ""
+        self.status_label.setText(f"Falha ao gerar período {index + 1}. {summarize_error(message, engine_name)}")
+        self._update_play_button_label()
+        # Só interrompe com um aviso se o usuário estava esperando o áudio.
+        if was_waiting and engine is not None:
+            self._offer_engine_switch(engine, message)
+
+    def _offer_engine_switch(self, failed_engine: TTSEngine, message: str):
+        """Explica a falha do motor atual e oferece trocar por outro disponível."""
+        if failed_engine.id in self._engine_failure_notified:
+            return
+        self._engine_failure_notified.add(failed_engine.id)
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Não foi possível gerar o áudio")
+        box.setText(f"O motor \"{failed_engine.display_name}\" não conseguiu gerar o áudio.")
+        box.setInformativeText(
+            f"{summarize_error(message, limit=240)}\n\n"
+            "Isso costuma acontecer quando o serviço online muda e deixa de aceitar o "
+            "acesso. Você pode continuar lendo com outro motor de voz."
+        )
+        buttons: dict[object, str] = {}
+        for engine_id, label in (
+            ("piper", "Usar Piper (offline)"),
+            ("gtts", "Usar Google (gTTS)"),
+        ):
+            if engine_id != failed_engine.id and engine_id in ENGINES:
+                buttons[box.addButton(label, QMessageBox.ButtonRole.AcceptRole)] = engine_id
+        box.addButton("Agora não", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+
+        target_id = buttons.get(box.clickedButton())
+        if target_id is None:
+            return
+        self.is_playing_intent = True  # retoma a leitura sozinho após a troca
+        self.engine_combo.setCurrentIndex(self.engine_combo.findData(target_id))
 
     # ---------- Playback ----------
     def _play_current(self):
