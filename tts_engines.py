@@ -10,6 +10,35 @@ from pathlib import Path
 
 import edge_tts
 
+# Em 10/10/2026 a Microsoft passou a recusar (403) o host antigo usado pelo
+# edge-tts <= 7.2.8. O Edge atual usa api.msedgeservices.com, que ainda aceita o
+# mesmo token do edge-tts. Só aplicamos o desvio enquanto o edge-tts instalado
+# apontar para o host antigo: uma versão corrigida do upstream não é alterada.
+_EDGE_OLD_HOST = "speech.platform.bing.com"
+_EDGE_NEW_BASE = "api.msedgeservices.com/tts/cognitiveservices"
+
+
+def _patch_edge_tts_endpoint() -> None:
+    from edge_tts import communicate, constants, voices
+
+    if _EDGE_OLD_HOST not in getattr(constants, "WSS_URL", ""):
+        return
+    key = constants.TRUSTED_CLIENT_TOKEN
+    new_urls = {
+        "WSS_URL": f"wss://{_EDGE_NEW_BASE}/websocket/v1?Ocp-Apim-Subscription-Key={key}",
+        "VOICE_LIST": f"https://{_EDGE_NEW_BASE}/voices/list?Ocp-Apim-Subscription-Key={key}",
+    }
+    for module in (constants, communicate, voices):
+        for name, url in new_urls.items():
+            if hasattr(module, name):
+                setattr(module, name, url)
+
+
+try:
+    _patch_edge_tts_endpoint()
+except Exception as exc:  # noqa: BLE001 — sem o desvio, o app cai no aviso de troca de motor
+    print(f"[tts_engines] Não foi possível ajustar o endpoint do edge-tts: {exc}")
+
 PIPER_VOICE_DIR = Path.home() / ".cache" / "tts-reader" / "piper-voices"
 
 # Catálogo curado de vozes Piper: a melhor qualidade disponível para cada
