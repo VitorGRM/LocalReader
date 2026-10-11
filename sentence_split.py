@@ -3,6 +3,7 @@ Separador de sentenças com rastreamento exato de offsets (start/end) no texto
 original, para permitir highlight preciso no e-reader.
 """
 import re
+from bisect import bisect_right
 
 ABBREVIATIONS = {
     "sr.", "sra.", "srta.", "dr.", "dra.", "prof.", "profa.", "exmo.", "exma.",
@@ -95,3 +96,41 @@ def split_sentences(text: str) -> list[tuple[str, int, int]]:
         cursor = end
 
     return sentences
+
+
+# ---------------------------------------------------------------------------
+# Navegação por palavra dentro dos períodos. A posição de leitura é
+# (período, início da palavra no texto); ``None`` como palavra significa o
+# início do período (sua primeira palavra).
+_WORD_RE = re.compile(r"\S+")
+
+
+def word_starts(sentence: tuple[str, int, int]) -> list[int]:
+    """Início (no texto completo) de cada palavra do período."""
+    text, start, _ = sentence
+    return [start + m.start() for m in _WORD_RE.finditer(text)]
+
+
+def word_span(sentence: tuple[str, int, int], word_offset: int) -> tuple[int, int]:
+    """(início, fim) no texto completo da palavra que começa em ``word_offset``."""
+    text, start, _ = sentence
+    match = _WORD_RE.match(text, word_offset - start)
+    end = start + match.end() if match else word_offset
+    return word_offset, end
+
+
+def step_word(
+    sentences: list[tuple[str, int, int]], index: int, word_offset: int | None, step: int
+) -> tuple[int, int | None]:
+    """Anda ``step`` (+1/-1) palavras, passando para o período vizinho nas pontas."""
+    starts = word_starts(sentences[index])
+    position = 0 if word_offset is None else max(0, bisect_right(starts, word_offset) - 1)
+    target = position + step
+    if 0 <= target < len(starts):
+        return index, None if target == 0 else starts[target]
+    if target >= len(starts):
+        return (index + 1, None) if index + 1 < len(sentences) else (index, word_offset)
+    if index == 0:
+        return index, word_offset
+    previous = word_starts(sentences[index - 1])
+    return index - 1, previous[-1] if len(previous) > 1 else None

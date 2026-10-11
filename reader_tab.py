@@ -28,7 +28,7 @@ from document_loader import load_document
 from pdf_layout import LoadCancelled, PdfLayout, extract_pdf_layout, sentence_index_at_offset
 from pdf_view import PdfView
 from reading_time import ReadingTimeEstimator
-from sentence_split import split_sentences
+from sentence_split import split_sentences, word_span
 from tts_engines import ENGINES
 from tts_pipeline import SentencePipeline
 
@@ -115,6 +115,8 @@ class ReaderView(QTextEdit):
 
     navigate_prev = pyqtSignal()
     navigate_next = pyqtSignal()
+    word_prev = pyqtSignal()
+    word_next = pyqtSignal()
     toggle_play = pyqtSignal()
     sentence_clicked = pyqtSignal(int)
 
@@ -128,34 +130,42 @@ class ReaderView(QTextEdit):
         self._sentences: list[tuple[str, int, int]] = []
         self._starts: list[int] = []
         self._current = -1
+        self._word: tuple[int, int] | None = None
         self._hover: int | None = None
         self._press_pos: QPoint | None = None
         self._highlight_color = None
+        self._word_color = None
         self._hover_color = None
 
     def set_content(self, text: str, sentences: list[tuple[str, int, int]]) -> None:
         self._sentences = sentences
         self._starts = [start for _, start, _ in sentences]
         self._current = -1
+        self._word = None
         self._hover = None
         self.setPlainText(text)
 
-    def set_colors(self, highlight, hover) -> None:
-        self._highlight_color, self._hover_color = highlight, hover
+    def set_colors(self, highlight, word, hover) -> None:
+        self._highlight_color, self._word_color, self._hover_color = highlight, word, hover
         self._refresh_selections()
 
-    def set_current(self, index: int, scroll: bool = True) -> None:
+    def set_current(self, index: int, scroll: bool = True, word: tuple[int, int] | None = None) -> None:
+        """``word``: (início, fim) da palavra escolhida com as setas, destacada à parte."""
         self._current = index
+        self._word = word
         if self._hover == index:
             self._hover = None
         self._refresh_selections()
-        if scroll and 0 <= index < len(self._sentences):
+        if not scroll or not 0 <= index < len(self._sentences):
+            return
+        # Adiado: o layout do documento precisa estar calculado para medir a posição.
+        if word is not None:
+            QTimer.singleShot(0, lambda pos=word[0]: self._ensure_visible(pos))
+        else:
             start = self._sentences[index][1]
-            # Adiado: o layout do documento precisa estar calculado para medir a posição.
             QTimer.singleShot(0, lambda pos=start: self._scroll_to_top(pos))
 
-    def _selection(self, index: int, color) -> QTextEdit.ExtraSelection:
-        _, start, end = self._sentences[index]
+    def _range_selection(self, start: int, end: int, color) -> QTextEdit.ExtraSelection:
         cursor = QTextCursor(self.document())
         cursor.setPosition(start)
         cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
@@ -166,13 +176,28 @@ class ReaderView(QTextEdit):
         selection.cursor = cursor
         return selection
 
+    def _selection(self, index: int, color) -> QTextEdit.ExtraSelection:
+        _, start, end = self._sentences[index]
+        return self._range_selection(start, end, color)
+
     def _refresh_selections(self) -> None:
         selections = []
         if self._hover is not None and self._hover_color is not None and self._hover < len(self._sentences):
             selections.append(self._selection(self._hover, self._hover_color))
         if 0 <= self._current < len(self._sentences) and self._highlight_color is not None:
             selections.append(self._selection(self._current, self._highlight_color))
+            if self._word is not None and self._word_color is not None:
+                selections.append(self._range_selection(*self._word, self._word_color))
         self.setExtraSelections(selections)
+
+    def _ensure_visible(self, char_pos: int) -> None:
+        """Rola só o necessário para a posição ficar à vista (sem saltos ao andar por palavra)."""
+        cursor = QTextCursor(self.document())
+        cursor.setPosition(char_pos)
+        rect = self.cursorRect(cursor)
+        viewport = self.viewport().rect()
+        if rect.top() < SCROLL_TOP_MARGIN or rect.bottom() > viewport.bottom() - SCROLL_TOP_MARGIN:
+            self._scroll_to_top(char_pos)
 
     def _scroll_to_top(self, char_pos: int) -> None:
         cursor = QTextCursor(self.document())
@@ -240,6 +265,10 @@ class ReaderView(QTextEdit):
             self.navigate_prev.emit()
         elif key == Qt.Key.Key_Down:
             self.navigate_next.emit()
+        elif key == Qt.Key.Key_Left:
+            self.word_prev.emit()
+        elif key == Qt.Key.Key_Right:
+            self.word_next.emit()
         elif key == Qt.Key.Key_Space:
             self.toggle_play.emit()
         else:
@@ -325,6 +354,8 @@ class ReaderTab(QWidget):
     sentence_clicked = pyqtSignal(int)
     navigate_prev = pyqtSignal()
     navigate_next = pyqtSignal()
+    word_prev = pyqtSignal()
+    word_next = pyqtSignal()
     toggle_play = pyqtSignal()
     sentence_ready = pyqtSignal(int, str)
     sentence_failed = pyqtSignal(int, str)
@@ -339,6 +370,8 @@ class ReaderTab(QWidget):
         self.sentences: list[tuple[str, int, int]] = []
         self.layout_info: PdfLayout | None = None
         self.current_index = -1
+        # Palavra escolhida com ←/→ (início no texto); None = início do período.
+        self.word_offset: int | None = None
         self.pipeline: SentencePipeline | None = None
         self.estimator = ReadingTimeEstimator(gap_ms=gap_ms)
         self.status_text = READY_MESSAGE
@@ -397,6 +430,8 @@ class ReaderTab(QWidget):
         for view in (self.text_view, self.pdf_view):
             view.navigate_prev.connect(self.navigate_prev)
             view.navigate_next.connect(self.navigate_next)
+            view.word_prev.connect(self.word_prev)
+            view.word_next.connect(self.word_next)
             view.toggle_play.connect(self.toggle_play)
             view.sentence_clicked.connect(self.sentence_clicked)
         self.zoom_out_btn.clicked.connect(lambda: self.pdf_view.zoom_by(1 / 1.2))
@@ -423,7 +458,7 @@ class ReaderTab(QWidget):
 
     def apply_theme(self, theme) -> None:
         self.text_view.setStyleSheet(theme.reader_stylesheet())
-        self.text_view.set_colors(theme.highlight_color, theme.hover_color)
+        self.text_view.set_colors(theme.highlight_color, theme.word_highlight_color, theme.hover_color)
         self.pdf_view.set_background(theme.pdf_background_color)
         self.start_page.apply_theme(theme.muted_text_color())
 
@@ -506,6 +541,7 @@ class ReaderTab(QWidget):
         self.sentences = doc.sentences
         self.layout_info = doc.layout
         self.current_index = 0 if self.sentences else -1
+        self.word_offset = None
         self.text_view.set_content(doc.text, doc.sentences)
         if doc.kind == "pdf" and doc.layout is not None:
             self.pdf_view.set_document(self.path, doc.layout)
@@ -521,11 +557,21 @@ class ReaderTab(QWidget):
     # ---------- Destaque ----------
     def highlight_current(self, scroll: bool = True) -> None:
         page = self.stack.currentIndex()
+        word = None
+        if self.word_offset is not None and 0 <= self.current_index < len(self.sentences):
+            word = word_span(self.sentences[self.current_index], self.word_offset)
         # A view escondida também é atualizada (sem rolar) para a troca PDF/Texto
         # já abrir no período certo.
-        self.text_view.set_current(self.current_index, scroll=scroll and page == PAGE_TEXT)
+        self.text_view.set_current(self.current_index, scroll=scroll and page == PAGE_TEXT, word=word)
         if self.kind == "pdf":
-            self.pdf_view.set_current(self.current_index, scroll=scroll and page == PAGE_PDF)
+            self.pdf_view.set_current(self.current_index, scroll=scroll and page == PAGE_PDF, word=word)
+
+    @property
+    def start_in_sentence(self) -> int:
+        """Onde a leitura começa dentro do período atual (0 = do início)."""
+        if self.word_offset is None or not 0 <= self.current_index < len(self.sentences):
+            return 0
+        return self.word_offset - self.sentences[self.current_index][1]
 
     # ---------- Áudio ----------
     def reset_pipeline(self) -> None:

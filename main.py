@@ -59,6 +59,7 @@ from reader_tab import (
     wait_for_loaders,
 )
 from reading_time import format_duration
+from sentence_split import step_word
 from theme import MODE_LABELS, MODES, ThemeManager
 from tts_engines import ENGINE_ORDER, ENGINES, TTSEngine, VoiceInfo
 from update_ui import UpdateManager
@@ -66,6 +67,7 @@ from update_ui import UpdateManager
 PREFETCH_AHEAD = 3
 UPDATE_CHECK_DELAY_MS = 3000
 SENTENCE_END_DELAY_MS = 250
+WORD_PLAY_DELAY_MS = 350
 TIME_UPDATE_INTERVAL_S = 0.5
 KEEP_AUDIO_KEY = "keep_audio_open"
 LAST_DIR_KEY = "last_open_dir"
@@ -243,9 +245,17 @@ class MainWindow(QMainWindow):
         self._active_tab: ReaderTab | None = None
         self.is_playing_intent = False
         self.waiting_index: int | None = None
+        self._waiting_start = 0  # palavra (posição no período) do áudio aguardado
         self._playing_tab: ReaderTab | None = None  # aba e período cujo áudio está no player
         self._playing_index: int | None = None
+        self._playing_start = 0
         self._syncing_controls = False
+        # Andando por palavra com o áudio tocando: espera as teclas pararem antes de
+        # gerar o áudio, em vez de sintetizar cada palavra pela qual se passou.
+        self._word_play_timer = QTimer(self)
+        self._word_play_timer.setSingleShot(True)
+        self._word_play_timer.setInterval(WORD_PLAY_DELAY_MS)
+        self._word_play_timer.timeout.connect(lambda: self.is_playing_intent and self._play_current())
 
         self.catalog: dict[str, dict[str, list[VoiceInfo]]] = {}
         self._voice_threads: list[VoiceLoaderThread] = []
@@ -555,6 +565,8 @@ class MainWindow(QMainWindow):
         tab.sentence_clicked.connect(lambda index: self._on_sentence_clicked(tab, index))
         tab.navigate_prev.connect(lambda: tab is self._active_tab and self._go_previous())
         tab.navigate_next.connect(lambda: tab is self._active_tab and self._go_next())
+        tab.word_prev.connect(lambda: tab is self._active_tab and self._step_word(-1))
+        tab.word_next.connect(lambda: tab is self._active_tab and self._step_word(1))
         tab.toggle_play.connect(lambda: tab is self._active_tab and self._toggle_play_pause())
         tab.sentence_ready.connect(lambda index, path: self._on_sentence_ready(tab, index, path))
         tab.sentence_failed.connect(lambda index, message: self._on_sentence_failed(tab, index, message))
@@ -878,7 +890,11 @@ class MainWindow(QMainWindow):
 
     # ---------- Áudio gerado ----------
     def _on_sentence_ready(self, tab: ReaderTab, index: int, path: str):
-        if tab is self._active_tab and index == self.waiting_index:
+        if tab is not self._active_tab or index != self.waiting_index or tab.pipeline is None:
+            return
+        # O período pode ter ficado pronto inteiro enquanto se espera a versão que
+        # começa numa palavra (ou vice-versa): só toca o áudio aguardado.
+        if path == tab.pipeline.path_for(index, self._waiting_start):
             self.waiting_index = None
             self._play_path(tab, path)
 
@@ -933,6 +949,7 @@ class MainWindow(QMainWindow):
     def _stop_playback(self):
         self.is_playing_intent = False
         self.waiting_index = None
+        self._word_play_timer.stop()
         self.player.stop()
         self._playing_index = None
         self._update_play_button_label()
@@ -941,18 +958,20 @@ class MainWindow(QMainWindow):
         tab = self._active_tab
         if tab is None or tab.pipeline is None or tab.current_index < 0:
             return
-        if tab.pipeline.is_cached(tab.current_index):
-            self._play_path(tab, tab.pipeline.path_for(tab.current_index))
+        index, start = tab.current_index, tab.start_in_sentence
+        if tab.pipeline.is_cached(index, start):
+            self._play_path(tab, tab.pipeline.path_for(index, start))
         else:
-            self.waiting_index = tab.current_index
-            tab.set_status(f"Carregando período {tab.current_index + 1}...")
-            tab.pipeline.request(tab.current_index, tab.sentences[tab.current_index][0])
+            self.waiting_index, self._waiting_start = index, start
+            tab.set_status(f"Carregando período {index + 1}...")
+            tab.pipeline.request(index, tab.sentences[index][0], start)
             self._update_play_button_label()
 
     def _play_path(self, tab: ReaderTab, path: str):
         self.player.stop()
         self._playing_tab = tab
         self._playing_index = tab.current_index
+        self._playing_start = tab.start_in_sentence
         self.player.setSource(QUrl.fromLocalFile(path))
         self.player.play()
         tab.set_status(f"Lendo período {tab.current_index + 1} de {len(tab.sentences)}")
@@ -1032,6 +1051,7 @@ class MainWindow(QMainWindow):
                 and self.player.source().isValid()
                 and self._playing_tab is tab
                 and self._playing_index == tab.current_index
+                and self._playing_start == tab.start_in_sentence
             ):
                 self.player.play()
             else:
@@ -1053,7 +1073,9 @@ class MainWindow(QMainWindow):
         if tab is None or not 0 <= index < len(tab.sentences):
             return
         tab.current_index = index
+        tab.word_offset = None
         self.waiting_index = None
+        self._word_play_timer.stop()
         tab.highlight_current(scroll=scroll)
         self._update_progress_label()
         tab.ensure_prefetch(PREFETCH_AHEAD)
@@ -1063,6 +1085,27 @@ class MainWindow(QMainWindow):
             self.player.stop()
             self._playing_index = None
             self._update_play_button_label()
+
+    def _step_word(self, step: int):
+        """←/→: anda uma palavra; a leitura passa a começar nela."""
+        tab = self._active_tab
+        if tab is None or tab.current_index < 0:
+            return
+        index, word = step_word(tab.sentences, tab.current_index, tab.word_offset, step)
+        if (index, word) == (tab.current_index, tab.word_offset):
+            return
+        sentence_changed = index != tab.current_index
+        tab.current_index, tab.word_offset = index, word
+        self.waiting_index = None
+        self.player.stop()
+        self._playing_index = None
+        tab.highlight_current(scroll=True)
+        if sentence_changed:
+            self._update_progress_label()
+            tab.ensure_prefetch(PREFETCH_AHEAD)
+        if self.is_playing_intent:
+            self._word_play_timer.start()
+        self._update_play_button_label()
 
     def _go_next(self):
         tab = self._active_tab

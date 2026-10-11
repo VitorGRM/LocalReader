@@ -18,7 +18,7 @@ from PyQt6.QtWidgets import (
 )
 
 from pdf_layout import PdfLayout
-from theme import PDF_HIGHLIGHT, PDF_HOVER
+from theme import PDF_HIGHLIGHT, PDF_HOVER, PDF_WORD
 
 PAGE_GAP = 14.0  # pontos entre páginas
 SCENE_PAD = 14.0
@@ -53,6 +53,8 @@ class PdfView(QGraphicsView):
     sentence_clicked = pyqtSignal(int)
     navigate_prev = pyqtSignal()
     navigate_next = pyqtSignal()
+    word_prev = pyqtSignal()
+    word_next = pyqtSignal()
     toggle_play = pyqtSignal()
 
     def __init__(self, parent=None):
@@ -201,21 +203,23 @@ class PdfView(QGraphicsView):
     def _make_items(self, index: int, color: QColor, z: float) -> list[QGraphicsRectItem]:
         if self._layout is None or not 0 <= index < len(self._layout.sentence_rects):
             return []
-        items = []
-        for page_no, (x0, y0, x1, y1) in self._layout.sentence_rects[index]:
-            page = self._pages[page_no]
-            rect = QRectF(
+        return [self._add_rect(page_no, rect, color, z) for page_no, rect in self._layout.sentence_rects[index]]
+
+    def _add_rect(self, page_no: int, rect: tuple[float, float, float, float], color: QColor, z: float):
+        page = self._pages[page_no]
+        x0, y0, x1, y1 = rect
+        item = self._scene.addRect(
+            QRectF(
                 page.x + x0 - HIGHLIGHT_PAD,
                 page.top + y0 - HIGHLIGHT_PAD,
                 (x1 - x0) + 2 * HIGHLIGHT_PAD,
                 (y1 - y0) + 2 * HIGHLIGHT_PAD,
             )
-            item = self._scene.addRect(rect)
-            item.setBrush(QBrush(color))
-            item.setPen(QPen(Qt.PenStyle.NoPen))
-            item.setZValue(z)
-            items.append(item)
-        return items
+        )
+        item.setBrush(QBrush(color))
+        item.setPen(QPen(Qt.PenStyle.NoPen))
+        item.setZValue(z)
+        return item
 
     @staticmethod
     def _remove_items(items: list[QGraphicsRectItem]) -> None:
@@ -225,13 +229,22 @@ class PdfView(QGraphicsView):
                 scene.removeItem(item)
         items.clear()
 
-    def set_current(self, index: int, scroll: bool = True) -> None:
+    def set_current(self, index: int, scroll: bool = True, word: tuple[int, int] | None = None) -> None:
+        """``word``: (início, fim) no texto da palavra escolhida com as setas."""
         self._current = index
         self._remove_items(self._current_items)
         self._current_items = self._make_items(index, PDF_HIGHLIGHT, 2)
+        word_item = None
+        if word is not None and self._layout is not None:
+            found = self._layout.word_rect_at(word[0])
+            if found is not None:
+                word_item = self._add_rect(*found, PDF_WORD, 3)
+                self._current_items.append(word_item)
         if self._hover == index:
             self._set_hover(None)
-        if scroll and self._current_items:
+        if scroll and word_item is not None:
+            self._ensure_visible(word_item.rect())
+        elif scroll and self._current_items:
             self._ensure_visible(self._current_items[0].rect())
 
     def _set_hover(self, index: int | None) -> None:
@@ -309,6 +322,10 @@ class PdfView(QGraphicsView):
             self.navigate_prev.emit()
         elif key == Qt.Key.Key_Down:
             self.navigate_next.emit()
+        elif key == Qt.Key.Key_Left:
+            self.word_prev.emit()
+        elif key == Qt.Key.Key_Right:
+            self.word_next.emit()
         elif key == Qt.Key.Key_Space:
             self.toggle_play.emit()
         else:

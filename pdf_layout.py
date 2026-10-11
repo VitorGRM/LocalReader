@@ -1,12 +1,14 @@
-"""Texto de um PDF junto com a posição de cada período nas páginas.
+"""Texto de um PDF junto com a posição de cada período e palavra nas páginas.
 
 O texto é montado a partir das palavras que o PyMuPDF devolve
 (``get_text("words")``), guardando o retângulo de cada uma. Depois de dividir o
 texto em períodos, cada período vira uma lista de retângulos (um por trecho de
 linha), usados para destacar o período sobre a página e para saber em qual
-período o mouse está. Trabalhar com palavras, e não caractere a caractere,
-mantém a abertura de livros inteiros rápida.
+período o mouse está; o retângulo de cada palavra destaca a palavra escolhida
+com as setas. Trabalhar com palavras, e não caractere a caractere, mantém a
+abertura de livros inteiros rápida.
 """
+from array import array
 from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
 from typing import Callable
@@ -29,12 +31,37 @@ class LoadCancelled(Exception):
 
 
 @dataclass
+class PdfWords:
+    """Palavras do texto em arrays compactos (livros longos têm centenas de milhares)."""
+
+    starts: array = field(default_factory=lambda: array("q"))
+    ends: array = field(default_factory=lambda: array("q"))
+    pages: array = field(default_factory=lambda: array("i"))
+    lines: array = field(default_factory=lambda: array("i"))  # identificador global da linha
+    rects: array = field(default_factory=lambda: array("d"))  # 4 valores por palavra
+
+    def append(self, start: int, end: int, page: int, line: int, rect: Rect) -> None:
+        self.starts.append(start)
+        self.ends.append(end)
+        self.pages.append(page)
+        self.lines.append(line)
+        self.rects.extend(rect)
+
+    def rect(self, i: int) -> Rect:
+        return tuple(self.rects[4 * i: 4 * i + 4])
+
+    def __len__(self) -> int:
+        return len(self.starts)
+
+
+@dataclass
 class PdfLayout:
     text: str
     sentences: list[tuple[str, int, int]]
     page_sizes: list[tuple[float, float]]
     # Para cada período: lista de (página, retângulo).
     sentence_rects: list[list[tuple[int, Rect]]]
+    words: PdfWords = field(default_factory=PdfWords, repr=False)
     _page_index: dict[int, list[tuple[Rect, int]]] = field(default_factory=dict, repr=False)
 
     def __post_init__(self):
@@ -49,14 +76,12 @@ class PdfLayout:
                 return index
         return None
 
-
-@dataclass
-class _Word:
-    start: int  # posição no texto
-    end: int
-    page: int
-    line: int  # identificador global da linha
-    rect: Rect
+    def word_rect_at(self, offset: int) -> tuple[int, Rect] | None:
+        """(página, retângulo) da palavra que começa em ``offset`` no texto."""
+        i = bisect_left(self.words.starts, offset)
+        if i < len(self.words) and self.words.starts[i] == offset:
+            return self.words.pages[i], self.words.rect(i)
+        return None
 
 
 def _page_words(page: pymupdf.Page):
@@ -76,7 +101,7 @@ def extract_pdf_layout(
 ) -> PdfLayout:
     parts: list[str] = []
     length = 0
-    words: list[_Word] = []
+    words = PdfWords()
     page_sizes: list[tuple[float, float]] = []
     line_count = 0
 
@@ -109,33 +134,30 @@ def extract_pdf_layout(
                 else:
                     add(WORD_SEP)
                 current = (block_no, line_no)
-                words.append(_Word(length, length + len(word), page_no, line_count, rect))
+                words.append(length, length + len(word), page_no, line_count, rect)
                 add(word)
 
     text = "".join(parts)
     sentences = split_sentences(text)
-    word_starts = [w.start for w in words]
-    word_ends = [w.end for w in words]
-    sentence_rects = [_rects_for_range(words, word_starts, word_ends, start, end) for _, start, end in sentences]
-    return PdfLayout(text, sentences, page_sizes, sentence_rects)
+    sentence_rects = [_rects_for_range(words, start, end) for _, start, end in sentences]
+    return PdfLayout(text, sentences, page_sizes, sentence_rects, words)
 
 
-def _rects_for_range(
-    words: list[_Word], word_starts: list[int], word_ends: list[int], start: int, end: int
-) -> list[tuple[int, Rect]]:
+def _rects_for_range(words: PdfWords, start: int, end: int) -> list[tuple[int, Rect]]:
     """Um retângulo por linha com palavras que tocam text[start:end]."""
-    first = bisect_right(word_ends, start)  # primeira palavra que termina depois de start
-    last = bisect_left(word_starts, end)  # palavras com início antes de end
+    first = bisect_right(words.ends, start)  # primeira palavra que termina depois de start
+    last = bisect_left(words.starts, end)  # palavras com início antes de end
     rects: list[tuple[int, Rect]] = []
     current_line = None
     x0 = y0 = x1 = y1 = 0.0
     page = 0
-    for word in words[first:last]:
-        bx0, by0, bx1, by1 = word.rect
-        if word.line != current_line:
+    for i in range(first, last):
+        bx0, by0, bx1, by1 = words.rect(i)
+        line = words.lines[i]
+        if line != current_line:
             if current_line is not None:
                 rects.append((page, (x0, y0, x1, y1)))
-            current_line, page = word.line, word.page
+            current_line, page = line, words.pages[i]
             x0, y0, x1, y1 = bx0, by0, bx1, by1
         else:
             x0, y0 = min(x0, bx0), min(y0, by0)

@@ -22,6 +22,7 @@ _LIGHT_COLORS = {
     "reader_background": "#fffdf7",
     "reader_text": "#2b2b2b",
     "highlight": "#ffe08a",
+    "word_highlight": "#ffb84d",
     "hover": "#e3ebfb",
     "muted_text": "#555555",
     "info_background": "#f0f0f0",
@@ -32,6 +33,7 @@ _DARK_COLORS = {
     "reader_background": "#1b1c1f",
     "reader_text": "#e4e1d8",
     "highlight": "#5a4a12",
+    "word_highlight": "#a0761a",
     "hover": "#2a3242",
     "muted_text": "#a8abb0",
     "info_background": "#2f3135",
@@ -41,6 +43,7 @@ _DARK_COLORS = {
 # Sobre a página do PDF (sempre clara), com transparência para o texto aparecer.
 PDF_HIGHLIGHT = QColor(255, 196, 0, 95)
 PDF_HOVER = QColor(60, 120, 230, 45)
+PDF_WORD = QColor(255, 130, 0, 110)
 
 
 def _dark_palette() -> QPalette:
@@ -126,6 +129,10 @@ class ThemeManager(QObject):
     @property
     def highlight_color(self) -> QColor:
         return self._color("highlight")
+
+    @property
+    def word_highlight_color(self) -> QColor:
+        return self._color("word_highlight")
 
     @property
     def hover_color(self) -> QColor:

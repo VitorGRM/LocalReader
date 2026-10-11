@@ -37,8 +37,8 @@ class SentencePipeline(QObject):
         # do novo (WinError 32) nem deixar áudio do texto anterior para trás.
         self.cache_dir = tempfile.mkdtemp(prefix=f"{digest}_", dir=cache_root)
 
-        self._pending: set[int] = set()
-        self._inflight: set[int] = set()
+        self._pending: set[tuple[int, int]] = set()
+        self._inflight: set[tuple[int, int]] = set()
         self._lock = threading.Lock()
         self._closed = False
 
@@ -61,27 +61,32 @@ class SentencePipeline(QObject):
         self._loop.run_until_complete(self._loop.shutdown_asyncgens())
         self._loop.close()
 
-    def path_for(self, index: int) -> str:
-        return os.path.join(self.cache_dir, f"{index:06d}{self.engine.output_extension}")
+    # ``start`` = posição (dentro do período) da palavra onde a leitura começa;
+    # 0 é o período inteiro. Cada início tem seu próprio arquivo no cache.
+    def path_for(self, index: int, start: int = 0) -> str:
+        suffix = f"_{start:05d}" if start else ""
+        return os.path.join(self.cache_dir, f"{index:06d}{suffix}{self.engine.output_extension}")
 
-    def is_cached(self, index: int) -> bool:
-        return os.path.exists(self.path_for(index))
+    def is_cached(self, index: int, start: int = 0) -> bool:
+        return os.path.exists(self.path_for(index, start))
 
-    def request(self, index: int, text: str) -> None:
+    def request(self, index: int, text: str, start: int = 0) -> None:
         if self._closed:
             return
+        key = (index, start)
         with self._lock:
-            if index in self._pending or index in self._inflight or self.is_cached(index):
+            if key in self._pending or key in self._inflight or self.is_cached(index, start):
                 return
-            self._pending.add(index)
-        asyncio.run_coroutine_threadsafe(self._synth(index, text), self._loop)
+            self._pending.add(key)
+        asyncio.run_coroutine_threadsafe(self._synth(index, start, text[start:]), self._loop)
 
-    async def _synth(self, index: int, text: str) -> None:
+    async def _synth(self, index: int, start: int, text: str) -> None:
+        key = (index, start)
         async with self._semaphore:
             with self._lock:
-                self._pending.discard(index)
-                self._inflight.add(index)
-            path = self.path_for(index)
+                self._pending.discard(key)
+                self._inflight.add(key)
+            path = self.path_for(index, start)
             tmp_path = path + ".part"
             try:
                 await self.engine.synthesize(text, self.voice_id, self.rate_percent, self.pitch_hz, tmp_path)
@@ -101,7 +106,7 @@ class SentencePipeline(QObject):
                     self.sentence_failed.emit(index, str(exc))
             finally:
                 with self._lock:
-                    self._inflight.discard(index)
+                    self._inflight.discard(key)
 
     def shutdown(self) -> None:
         self._closed = True

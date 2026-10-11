@@ -56,6 +56,16 @@ class PdfLayoutTest(unittest.TestCase):
         self.assertIsNone(layout.sentence_at(0, (x0 + x1) / 2, (y0 + y1) / 2))
         self.assertIsNone(layout.sentence_at(1, 5, 5))
 
+    def test_word_rect_lookup(self):
+        _make_pdf(self.path, [[(60, "Primeira frase aqui.")]])
+        layout = extract_pdf_layout(self.path)
+        offset = layout.text.index("frase")
+        page, (x0, y0, x1, y1) = layout.word_rect_at(offset)
+        self.assertEqual(page, 0)
+        first = layout.word_rect_at(0)[1]
+        self.assertGreater(x0, first[2] - 1)  # "frase" fica à direita de "Primeira"
+        self.assertIsNone(layout.word_rect_at(offset + 1))  # meio de palavra
+
     def test_pdf_without_text(self):
         _make_pdf(self.path, [[]])
         layout = extract_pdf_layout(self.path)
