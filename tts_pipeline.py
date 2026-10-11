@@ -51,6 +51,15 @@ class SentencePipeline(QObject):
         asyncio.set_event_loop(self._loop)
         self._semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
         self._loop.run_forever()
+        # Encerrado: cancela as sínteses pendentes e fecha o loop de forma limpa,
+        # em vez de deixar o coletor de lixo despejar erros no log.
+        pending = asyncio.all_tasks(self._loop)
+        for task in pending:
+            task.cancel()
+        if pending:
+            self._loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        self._loop.run_until_complete(self._loop.shutdown_asyncgens())
+        self._loop.close()
 
     def path_for(self, index: int) -> str:
         return os.path.join(self.cache_dir, f"{index:06d}{self.engine.output_extension}")

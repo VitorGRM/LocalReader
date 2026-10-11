@@ -1,12 +1,14 @@
 """
 TTS Reader - leitor com TTS neural e OCR adaptativo de alta qualidade.
 
-Abra um PDF, DOCX, Markdown ou TXT (ou cole um texto): o app divide o
-conteúdo em períodos (sentenças), sintetiza o áudio de cada um sob demanda e
-vai pré-carregando os próximos períodos em segundo plano enquanto você ouve
-o atual, destacando e rolando o texto até o trecho lido. Use as setas para
-cima/baixo (ou os botões) para navegar entre períodos. A segunda aba extrai
-texto de PDFs e imagens e pode enviá-lo diretamente para o leitor.
+Cada documento abre numa aba própria (como num navegador), com texto, voz,
+velocidade e posição de leitura independentes. O app divide o conteúdo em
+períodos (sentenças), sintetiza o áudio de cada um sob demanda e vai
+pré-carregando os próximos em segundo plano enquanto você ouve o atual,
+destacando o trecho lido — sobre a própria página, no caso de PDFs. Passe o
+mouse sobre um período e clique para pular direto para ele; as setas para
+cima/baixo também navegam. A segunda aba extrai texto de PDFs e imagens por
+OCR e pode enviá-lo para o leitor.
 """
 import asyncio
 import os
@@ -17,7 +19,7 @@ import traceback
 from datetime import datetime, timedelta
 
 from PyQt6.QtCore import Qt, QObject, QSettings, QThread, QTimer, QUrl, pyqtSignal
-from PyQt6.QtGui import QAction, QActionGroup, QFont, QTextCharFormat, QTextCursor
+from PyQt6.QtGui import QAction, QActionGroup, QFont, QKeySequence, QTextCursor
 from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PyQt6.QtWidgets import (
     QApplication,
@@ -40,20 +42,25 @@ from PyQt6.QtWidgets import (
     QSlider,
     QTabWidget,
     QTextEdit,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
 from app_version import GITHUB_REPO, __version__
 from audio_keepalive import AudioKeepAlive
-from document_loader import load_document
 from ocr_widget import OCRWidget
 from platform_support import is_frozen, setup_bundled_tools
-from reading_time import ReadingTimeEstimator, format_duration
-from sentence_split import split_sentences
+from reader_tab import (
+    FILE_DIALOG_FILTER,
+    READY_MESSAGE,
+    ReaderTab,
+    VoiceSettings,
+    wait_for_loaders,
+)
+from reading_time import format_duration
 from theme import MODE_LABELS, MODES, ThemeManager
 from tts_engines import ENGINE_ORDER, ENGINES, TTSEngine, VoiceInfo
-from tts_pipeline import SentencePipeline
 from update_ui import UpdateManager
 
 PREFETCH_AHEAD = 3
@@ -61,8 +68,11 @@ UPDATE_CHECK_DELAY_MS = 3000
 SENTENCE_END_DELAY_MS = 250
 TIME_UPDATE_INTERVAL_S = 0.5
 KEEP_AUDIO_KEY = "keep_audio_open"
+LAST_DIR_KEY = "last_open_dir"
+VOICE_SETTINGS_PREFIX = "voice/"
 SIDEBAR_WIDTH = 340
-SCROLL_TOP_MARGIN = 24
+DEFAULT_LANGUAGE = "Portuguese"
+DEFAULT_COUNTRY = "Brazil"
 
 
 # ---------------------------------------------------------------------------
@@ -148,32 +158,6 @@ class LogViewerDialog(QDialog):
         QApplication.clipboard().setText(self.text_edit.toPlainText())
 
 
-# ---------------------------------------------------------------------------
-class ReaderView(QTextEdit):
-    """QTextEdit somente-leitura que emite navegação ao invés de mover o
-    cursor de edição com as setas para cima/baixo e barra de espaço."""
-
-    navigate_prev = pyqtSignal()
-    navigate_next = pyqtSignal()
-    toggle_play = pyqtSignal()
-
-    def keyPressEvent(self, event):
-        key = event.key()
-        if key == Qt.Key.Key_Up:
-            self.navigate_prev.emit()
-            event.accept()
-            return
-        if key == Qt.Key.Key_Down:
-            self.navigate_next.emit()
-            event.accept()
-            return
-        if key == Qt.Key.Key_Space:
-            self.toggle_play.emit()
-            event.accept()
-            return
-        super().keyPressEvent(event)
-
-
 class PasteTextDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -182,6 +166,7 @@ class PasteTextDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel("Cole o texto que deseja ler:"))
         self.text_edit = QTextEdit()
+        self.text_edit.setAcceptRichText(False)
         layout.addWidget(self.text_edit)
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -230,29 +215,39 @@ def parse_locale_name(locale_name: str, locale_code: str) -> tuple[str, str]:
     return locale_name or locale_code, locale_code
 
 
+def _select_text(combo: QComboBox, preferred: list[str]) -> None:
+    for text in preferred:
+        index = combo.findText(text) if text else -1
+        if index >= 0:
+            combo.setCurrentIndex(index)
+            return
+    if combo.count():
+        combo.setCurrentIndex(0)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, log_manager: "LogManager", theme: ThemeManager):
         super().__init__()
         self.log_manager = log_manager
         self.theme = theme
         self.log_dialog: LogViewerDialog | None = None
-        self.estimator = ReadingTimeEstimator(gap_ms=SENTENCE_END_DELAY_MS)
-        self._playing_index: int | None = None  # período cujo áudio está no player
         self._last_time_update = 0.0
         self.settings = QSettings("LocalReader", "TTSReader")
         self._keep_audio_open = self.settings.value(KEEP_AUDIO_KEY, True, type=bool)
         self.audio_keepalive = AudioKeepAlive(self.log_manager.log, self)
 
-        self.setWindowTitle("TTS Reader — voz neural e OCR adaptativo")
+        self.setWindowTitle("TTS Reader")
         self.resize(1280, 800)
 
-        self.full_text = ""
-        self.sentences: list[tuple[str, int, int]] = []
-        self.current_index = -1
+        # Só a aba ativa toca; trocar de aba pausa a leitura da anterior.
+        self._active_tab: ReaderTab | None = None
         self.is_playing_intent = False
         self.waiting_index: int | None = None
+        self._playing_tab: ReaderTab | None = None  # aba e período cujo áudio está no player
+        self._playing_index: int | None = None
+        self._syncing_controls = False
+
         self.catalog: dict[str, dict[str, list[VoiceInfo]]] = {}
-        self.pipeline: SentencePipeline | None = None
         self._voice_threads: list[VoiceLoaderThread] = []
         self._engine_voices: dict[str, list[VoiceInfo]] = {}
         self._engine_failure_notified: set[str] = set()
@@ -261,8 +256,8 @@ class MainWindow(QMainWindow):
         self._build_menu()
         self._setup_player()
         self.theme.changed.connect(self._apply_theme)
+        self._new_tab(self._saved_voice_settings())
         self._apply_theme()
-        self._on_engine_changed()
         self.audio_keepalive.set_enabled(self._keep_audio_open)
 
         self.update_manager = UpdateManager(self, self.log_manager.log)
@@ -271,6 +266,24 @@ class MainWindow(QMainWindow):
 
     # ---------- Menu ----------
     def _build_menu(self):
+        file_menu = self.menuBar().addMenu("&Arquivo")
+        for text, shortcut, slot in (
+            ("&Nova aba", "Ctrl+T", lambda: self._new_tab()),
+            ("&Abrir arquivo...", "Ctrl+O", lambda: self._open_file_dialog(self._active_tab)),
+            ("&Colar texto...", "Ctrl+Shift+V", lambda: self._paste_into(self._active_tab)),
+            ("&Fechar aba", "Ctrl+W", lambda: self._close_tab(self.doc_tabs.currentIndex())),
+        ):
+            action = QAction(text, self)
+            action.setShortcut(QKeySequence(shortcut))
+            action.triggered.connect(slot)
+            file_menu.addAction(action)
+        file_menu.addSeparator()
+        for text, shortcut, step in (("Próxima aba", "Ctrl+Tab", 1), ("Aba anterior", "Ctrl+Shift+Tab", -1)):
+            action = QAction(text, self)
+            action.setShortcut(QKeySequence(shortcut))
+            action.triggered.connect(lambda _checked=False, s=step: self._cycle_tab(s))
+            file_menu.addAction(action)
+
         view_menu = self.menuBar().addMenu("&Exibir")
         theme_menu = view_menu.addMenu("&Tema")
         theme_group = QActionGroup(self)
@@ -324,7 +337,7 @@ class MainWindow(QMainWindow):
         root_layout.setSpacing(0)
 
         root_layout.addWidget(self._build_sidebar())
-        root_layout.addWidget(self._build_reader_panel(), stretch=1)
+        root_layout.addWidget(self._build_document_tabs(), stretch=1)
 
         self.ocr_widget = OCRWidget()
         self.ocr_widget.send_to_tts.connect(self._receive_ocr_text)
@@ -332,13 +345,27 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(tts_tab, "🔊 Leitor TTS")
         self.tabs.addTab(self.ocr_widget, "🔎 OCR de alta qualidade")
 
-    def _receive_ocr_text(self, text: str):
-        self._load_document_text(text)
-        self.tabs.setCurrentIndex(0)
-        self.setWindowTitle("TTS Reader — Texto reconhecido por OCR")
-        self.status_label.setText(
-            f"OCR enviado ao leitor: {len(self.sentences)} períodos. Pronto para ler."
-        )
+    def _build_document_tabs(self) -> QWidget:
+        self.doc_tabs = QTabWidget()
+        self.doc_tabs.setTabsClosable(True)
+        self.doc_tabs.setMovable(True)
+        self.doc_tabs.setDocumentMode(True)
+        self.doc_tabs.setElideMode(Qt.TextElideMode.ElideRight)
+        self.doc_tabs.setUsesScrollButtons(True)
+        self.doc_tabs.tabBar().setStyleSheet("QTabBar::tab { max-width: 240px; }")
+        self.doc_tabs.tabCloseRequested.connect(self._close_tab)
+        self.doc_tabs.currentChanged.connect(self._on_tab_changed)
+
+        new_tab_btn = QToolButton()
+        new_tab_btn.setText("+")
+        new_tab_btn.setToolTip("Nova aba (Ctrl+T)")
+        new_tab_btn.setAutoRaise(True)
+        font = new_tab_btn.font()
+        font.setPointSize(font.pointSize() + 4)
+        new_tab_btn.setFont(font)
+        new_tab_btn.clicked.connect(lambda: self._new_tab())
+        self.doc_tabs.setCornerWidget(new_tab_btn, Qt.Corner.TopRightCorner)
+        return self.doc_tabs
 
     def _build_sidebar(self) -> QWidget:
         sidebar = QWidget()
@@ -353,13 +380,10 @@ class MainWindow(QMainWindow):
         scroll_content = QWidget()
         layout = QVBoxLayout(scroll_content)
 
-        # Abrir arquivo / colar texto
-        self.open_file_btn = QPushButton("📂 Abrir Arquivo (PDF/DOCX/MD/TXT)")
-        self.open_file_btn.clicked.connect(self._on_open_file_clicked)
-        self.paste_btn = QPushButton("📋 Colar Texto")
-        self.paste_btn.clicked.connect(self._on_paste_text_clicked)
-        layout.addWidget(self.open_file_btn)
-        layout.addWidget(self.paste_btn)
+        hint = QLabel("Os ajustes abaixo valem para a aba aberta.")
+        hint.setWordWrap(True)
+        self.sidebar_hint = hint
+        layout.addWidget(hint)
 
         # Voz
         voice_group = QGroupBox("Voz")
@@ -388,7 +412,7 @@ class MainWindow(QMainWindow):
             combo.setMinimumContentsLength(12)
         self.language_combo.currentIndexChanged.connect(self._on_language_changed)
         self.country_combo.currentIndexChanged.connect(self._on_country_changed)
-        self.voice_combo.currentIndexChanged.connect(self._on_voice_params_changed)
+        self.voice_combo.currentIndexChanged.connect(self._on_controls_changed)
 
         voice_layout.addWidget(QLabel("Idioma:"))
         voice_layout.addWidget(self.language_combo)
@@ -407,7 +431,7 @@ class MainWindow(QMainWindow):
         self.rate_slider.setValue(0)
         self.rate_label = QLabel("+0%")
         self.rate_slider.valueChanged.connect(lambda v: self.rate_label.setText(f"{v:+d}%"))
-        self.rate_slider.sliderReleased.connect(self._on_voice_params_changed)
+        self.rate_slider.sliderReleased.connect(self._on_controls_changed)
         rate_row = QHBoxLayout()
         rate_row.addWidget(self.rate_slider)
         rate_row.addWidget(self.rate_label)
@@ -418,7 +442,7 @@ class MainWindow(QMainWindow):
         self.pitch_slider.setValue(0)
         self.pitch_label = QLabel("+0Hz")
         self.pitch_slider.valueChanged.connect(lambda v: self.pitch_label.setText(f"{v:+d}Hz"))
-        self.pitch_slider.sliderReleased.connect(self._on_voice_params_changed)
+        self.pitch_slider.sliderReleased.connect(self._on_controls_changed)
         pitch_row = QHBoxLayout()
         pitch_row.addWidget(self.pitch_slider)
         pitch_row.addWidget(self.pitch_label)
@@ -470,7 +494,7 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(player_group)
 
-        self.status_label = QLabel("Carregando lista de vozes...")
+        self.status_label = QLabel(READY_MESSAGE)
         self.status_label.setWordWrap(True)
         self.status_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         layout.addWidget(self.status_label)
@@ -485,22 +509,14 @@ class MainWindow(QMainWindow):
 
         return sidebar
 
-    def _build_reader_panel(self) -> QWidget:
-        self.text_view = ReaderView()
-        self.text_view.setReadOnly(True)
-        self.text_view.setCursorWidth(0)
-        self.text_view.setFont(QFont("Georgia", 14))
-        self.text_view.navigate_prev.connect(self._go_previous)
-        self.text_view.navigate_next.connect(self._go_next)
-        self.text_view.toggle_play.connect(self._toggle_play_pause)
-        return self.text_view
-
     def _apply_theme(self):
         """Reaplica as cores que não vêm da paleta (leitor, destaque, textos secundários)."""
-        self.text_view.setStyleSheet(self.theme.reader_stylesheet())
         self.engine_info_label.setStyleSheet(self.theme.info_label_stylesheet())
+        self.sidebar_hint.setStyleSheet(f"color: {self.theme.muted_text_color()};")
         self.ocr_widget.apply_theme(self.theme.muted_text_color())
-        self._highlight_current(scroll=False)
+        for tab in self._all_tabs():
+            tab.apply_theme(self.theme)
+            tab.highlight_current(scroll=False)
 
     def _setup_player(self):
         self.player = QMediaPlayer()
@@ -518,12 +534,197 @@ class MainWindow(QMainWindow):
         self.log_dialog.raise_()
         self.log_dialog.activateWindow()
 
-    # ---------- Engine / voice loading ----------
+    # ---------- Abas ----------
+    def _all_tabs(self) -> list[ReaderTab]:
+        return [self.doc_tabs.widget(i) for i in range(self.doc_tabs.count())]
+
+    def _new_tab(self, settings: VoiceSettings | None = None, activate: bool = True) -> ReaderTab:
+        if settings is None:
+            # Nova aba herda a voz da aba atual; a partir daí, cada uma segue a sua.
+            settings = self._active_tab.settings.copy() if self._active_tab else self._saved_voice_settings()
+        tab = ReaderTab(settings, gap_ms=SENTENCE_END_DELAY_MS)
+        tab.apply_theme(self.theme)
+
+        tab.open_file_requested.connect(lambda: self._open_file_dialog(tab))
+        tab.paste_requested.connect(lambda: self._paste_into(tab))
+        tab.file_dropped.connect(lambda path: self._open_path(path, tab))
+        tab.document_loaded.connect(lambda: self._on_document_loaded(tab))
+        tab.load_failed.connect(lambda msg, details: self._on_load_failed(tab, msg, details))
+        tab.status_changed.connect(lambda text: self._on_tab_status(tab, text))
+        tab.title_changed.connect(lambda _title: self._update_tab_title(tab))
+        tab.sentence_clicked.connect(lambda index: self._on_sentence_clicked(tab, index))
+        tab.navigate_prev.connect(lambda: tab is self._active_tab and self._go_previous())
+        tab.navigate_next.connect(lambda: tab is self._active_tab and self._go_next())
+        tab.toggle_play.connect(lambda: tab is self._active_tab and self._toggle_play_pause())
+        tab.sentence_ready.connect(lambda index, path: self._on_sentence_ready(tab, index, path))
+        tab.sentence_failed.connect(lambda index, message: self._on_sentence_failed(tab, index, message))
+
+        index = self.doc_tabs.addTab(tab, tab.title)
+        if activate:
+            self.doc_tabs.setCurrentIndex(index)
+        return tab
+
+    def _cycle_tab(self, step: int):
+        count = self.doc_tabs.count()
+        if count > 1:
+            self.doc_tabs.setCurrentIndex((self.doc_tabs.currentIndex() + step) % count)
+
+    def _close_tab(self, index: int):
+        tab = self.doc_tabs.widget(index)
+        if tab is None:
+            return
+        if tab is self._active_tab or tab is self._playing_tab:
+            self._stop_playback()
+        if tab is self._playing_tab:
+            self._playing_tab = None
+        self.doc_tabs.removeTab(index)
+        tab.shutdown()
+        tab.deleteLater()
+        if self.doc_tabs.count() == 0:
+            self._new_tab()
+
+    def _on_tab_changed(self, index: int):
+        tab = self.doc_tabs.widget(index) if index >= 0 else None
+        if tab is self._active_tab:
+            return
+        self._stop_playback()
+        self._active_tab = tab
+        if tab is None:
+            return
+        self._sync_controls_from_tab(tab)
+        self._refresh_reader_controls()
+        tab.focus_reader()
+
+    def _update_tab_title(self, tab: ReaderTab):
+        index = self.doc_tabs.indexOf(tab)
+        if index < 0:
+            return
+        self.doc_tabs.setTabText(index, tab.title)
+        self.doc_tabs.setTabToolTip(index, tab.path or tab.title)
+        if tab is self._active_tab:
+            self.setWindowTitle(f"TTS Reader — {tab.title}")
+
+    def _on_tab_status(self, tab: ReaderTab, text: str):
+        if tab is self._active_tab:
+            self.status_label.setText(text)
+
+    def _refresh_reader_controls(self):
+        """Mostra no menu lateral o estado da aba ativa."""
+        tab = self._active_tab
+        if tab is None:
+            return
+        has_sentences = bool(tab.sentences)
+        for btn in (self.prev_btn, self.play_pause_btn, self.next_btn, self.restart_btn):
+            btn.setEnabled(has_sentences)
+        self.status_label.setText(tab.status_text)
+        self.setWindowTitle(f"TTS Reader — {tab.title}")
+        self._update_progress_label()
+        self._update_play_button_label()
+
+    # ---------- Abrir / colar ----------
+    def _target_tab(self, tab: ReaderTab | None) -> ReaderTab:
+        """A própria aba, se estiver vazia; senão o documento abre numa aba nova."""
+        if tab is not None and tab.is_empty:
+            return tab
+        return self._new_tab()
+
+    def _open_file_dialog(self, tab: ReaderTab | None):
+        start_dir = str(self.settings.value(LAST_DIR_KEY, ""))
+        path, _ = QFileDialog.getOpenFileName(self, "Abrir arquivo", start_dir, FILE_DIALOG_FILTER)
+        if not path:
+            return
+        self.settings.setValue(LAST_DIR_KEY, os.path.dirname(path))
+        self._open_path(path, tab)
+
+    def _open_path(self, path: str, tab: ReaderTab | None):
+        target = self._target_tab(tab)
+        self.doc_tabs.setCurrentWidget(target)
+        target.load_file(path)
+
+    def _paste_into(self, tab: ReaderTab | None):
+        dialog = PasteTextDialog(self)
+        if not dialog.exec():
+            return
+        text = dialog.get_text().strip()
+        if text:
+            target = self._target_tab(tab)
+            self.doc_tabs.setCurrentWidget(target)
+            target.load_text(text, "Texto colado")
+
+    def _receive_ocr_text(self, text: str):
+        target = self._target_tab(self._active_tab)
+        self.doc_tabs.setCurrentWidget(target)
+        target.load_text(text, "Texto do OCR")
+        self.tabs.setCurrentIndex(0)
+
+    def _on_document_loaded(self, tab: ReaderTab):
+        if tab is self._active_tab:
+            self._stop_playback()
+        tab.reset_pipeline()
+        tab.ensure_prefetch(PREFETCH_AHEAD)
+        if tab.sentences:
+            tab.set_status(f"Documento carregado: {len(tab.sentences)} períodos. Pronto para ler.")
+        elif tab.kind == "pdf":
+            tab.set_status(
+                "Este PDF não tem texto selecionável (provavelmente é digitalizado). "
+                "Use a aba OCR para reconhecer o texto e enviá-lo ao leitor."
+            )
+        else:
+            tab.set_status("Nenhum período reconhecível foi encontrado no texto.")
+        if tab is self._active_tab:
+            self._refresh_reader_controls()
+
+    def _on_load_failed(self, tab: ReaderTab, message: str, details: str):
+        self.log_manager.log(f"Falha ao abrir arquivo: {message}\n{details}")
+        QMessageBox.critical(self, "Erro ao abrir arquivo", summarize_error(message, limit=400))
+        if tab is self._active_tab:
+            self._refresh_reader_controls()
+
+    # ---------- Configurações de voz (por aba) ----------
+    def _saved_voice_settings(self) -> VoiceSettings:
+        s, p = self.settings, VOICE_SETTINGS_PREFIX
+        engine_id = str(s.value(p + "engine", ENGINE_ORDER[0] if ENGINE_ORDER else ""))
+        if engine_id not in ENGINES and ENGINE_ORDER:
+            engine_id = ENGINE_ORDER[0]
+        return VoiceSettings(
+            engine_id=engine_id,
+            language=str(s.value(p + "language", DEFAULT_LANGUAGE)),
+            country=str(s.value(p + "country", DEFAULT_COUNTRY)),
+            voice_id=str(s.value(p + "voice_id", "")),
+            rate=s.value(p + "rate", 0, type=int),
+            pitch=s.value(p + "pitch", 0, type=int),
+        )
+
+    def _save_voice_settings(self, settings: VoiceSettings) -> None:
+        """A última escolha vira o padrão das próximas sessões."""
+        p = VOICE_SETTINGS_PREFIX
+        self.settings.setValue(p + "engine", settings.engine_id)
+        self.settings.setValue(p + "language", settings.language)
+        self.settings.setValue(p + "country", settings.country)
+        self.settings.setValue(p + "voice_id", settings.voice_id)
+        self.settings.setValue(p + "rate", settings.rate)
+        self.settings.setValue(p + "pitch", settings.pitch)
+
     def _current_engine(self) -> TTSEngine | None:
         engine_id = self.engine_combo.currentData()
         return ENGINES.get(engine_id) if engine_id else None
 
-    def _on_engine_changed(self):
+    def _sync_controls_from_tab(self, tab: ReaderTab):
+        """Coloca os controles do menu lateral nos valores da aba."""
+        self._syncing_controls = True
+        try:
+            index = self.engine_combo.findData(tab.settings.engine_id)
+            self.engine_combo.setCurrentIndex(max(index, 0))
+            self.rate_slider.setValue(tab.settings.rate)
+            self.pitch_slider.setValue(tab.settings.pitch)
+            self._show_engine_info()
+            self._fill_voice_combos(tab)
+        finally:
+            self._syncing_controls = False
+        # Ajusta a aba se algo salvo não existe mais (ex.: voz removida do catálogo).
+        self._on_controls_changed()
+
+    def _show_engine_info(self):
         engine = self._current_engine()
         if engine is None:
             return
@@ -531,16 +732,115 @@ class MainWindow(QMainWindow):
         self.pitch_slider.setEnabled(engine.supports_pitch)
         self.pitch_label.setEnabled(engine.supports_pitch)
 
-        if engine.id in self._engine_voices:
-            self._apply_voice_catalog(self._engine_voices[engine.id])
-        else:
-            self.status_label.setText(f"Carregando vozes de {engine.display_name}...")
-            self._start_voice_loading(engine)
-        # _apply_voice_catalog (síncrona ou via callback assíncrono) sempre
-        # encadeia até _on_voice_params_changed, que recria o pipeline com o
-        # novo motor a partir do período atual e retoma a leitura se estava
-        # tocando — não é preciso chamar de novo aqui.
+    def _fill_voice_combos(self, tab: ReaderTab):
+        """Preenche idioma/país/voz com o catálogo do motor, preferindo o que a aba usa."""
+        engine = self._current_engine()
+        combos = (self.language_combo, self.country_combo, self.voice_combo)
+        for combo in combos:
+            combo.blockSignals(True)
+        try:
+            for combo in combos:
+                combo.clear()
+            if engine is None:
+                return
+            if engine.id not in self._engine_voices:
+                if not any(t.engine.id == engine.id for t in self._voice_threads):
+                    self._start_voice_loading(engine)
+                self.status_label.setText(f"Carregando vozes de {engine.display_name}...")
+                return
+            self.catalog = {}
+            for v in self._engine_voices[engine.id]:
+                lang, country = parse_locale_name(v.locale_name, v.locale)
+                self.catalog.setdefault(lang, {}).setdefault(country, []).append(v)
+            self.language_combo.addItems(sorted(self.catalog.keys()))
+            _select_text(self.language_combo, [tab.settings.language, DEFAULT_LANGUAGE])
+            self._fill_countries(tab)
+        finally:
+            for combo in combos:
+                combo.blockSignals(False)
 
+    def _fill_countries(self, tab: ReaderTab):
+        lang = self.language_combo.currentText()
+        self.country_combo.blockSignals(True)
+        self.country_combo.clear()
+        self.country_combo.addItems(sorted(self.catalog.get(lang, {}).keys()))
+        _select_text(self.country_combo, [tab.settings.country, DEFAULT_COUNTRY])
+        self.country_combo.blockSignals(False)
+        self._fill_voices(tab)
+
+    def _fill_voices(self, tab: ReaderTab):
+        lang = self.language_combo.currentText()
+        country = self.country_combo.currentText()
+        self.voice_combo.blockSignals(True)
+        self.voice_combo.clear()
+        for v in self.catalog.get(lang, {}).get(country, []):
+            label = f"{v.id} ({v.gender})" if v.gender != "N/A" else v.id
+            self.voice_combo.addItem(label, userData=v.id)
+        index = self.voice_combo.findData(tab.settings.voice_id)
+        if self.voice_combo.count():
+            self.voice_combo.setCurrentIndex(max(index, 0))
+        self.voice_combo.blockSignals(False)
+
+    def _on_engine_changed(self):
+        if self._syncing_controls or self._active_tab is None:
+            return
+        self._show_engine_info()
+        self._fill_voice_combos(self._active_tab)
+        # _fill_voice_combos pode ter disparado o carregamento assíncrono das vozes;
+        # quando ele terminar, _on_voices_loaded aplica a escolha nesta aba.
+        self._on_controls_changed()
+
+    def _on_language_changed(self):
+        if self._syncing_controls or self._active_tab is None:
+            return
+        self._fill_countries(self._active_tab)
+        self._on_controls_changed()
+
+    def _on_country_changed(self):
+        if self._syncing_controls or self._active_tab is None:
+            return
+        self._fill_voices(self._active_tab)
+        self._on_controls_changed()
+
+    def _on_controls_changed(self):
+        """Grava os controles na aba ativa e recria o áudio dela se algo mudou."""
+        tab = self._active_tab
+        if self._syncing_controls or tab is None:
+            return
+        engine_id = self.engine_combo.currentData() or ""
+        new = VoiceSettings(
+            engine_id=engine_id,
+            rate=self.rate_slider.value(),
+            pitch=self.pitch_slider.value(),
+        )
+        if self.voice_combo.count():
+            new.language = self.language_combo.currentText()
+            new.country = self.country_combo.currentText()
+            new.voice_id = self.voice_combo.currentData() or ""
+        else:
+            # Catálogo ainda carregando: mantém a escolha da aba até as vozes chegarem.
+            new.language, new.country = tab.settings.language, tab.settings.country
+            new.voice_id = tab.settings.voice_id if engine_id == tab.settings.engine_id else ""
+        if new == tab.settings and (tab.pipeline is not None or not tab.sentences or not new.voice_id):
+            return
+        tab.settings = new
+        if new.voice_id:
+            self._save_voice_settings(new)
+        if not tab.has_document:
+            return
+        was_playing = self.is_playing_intent
+        self.player.stop()
+        self.waiting_index = None
+        self._playing_index = None
+        tab.reset_pipeline()
+        tab.ensure_prefetch(PREFETCH_AHEAD)
+        self._update_time_display()
+        if was_playing and tab.pipeline is not None:
+            self._play_current()
+        else:
+            self._update_play_button_label()
+
+    # ---------- Carregamento das vozes ----------
     def _start_voice_loading(self, engine: TTSEngine):
         thread = VoiceLoaderThread(engine)
         self._voice_threads.append(thread)
@@ -556,184 +856,43 @@ class MainWindow(QMainWindow):
 
     def _on_voices_loaded(self, engine_id: str, voices: list[VoiceInfo]):
         self._engine_voices[engine_id] = voices
-        if engine_id != self.engine_combo.currentData():
-            return  # usuário já trocou de motor antes desta lista chegar
-        self._apply_voice_catalog(voices)
-        engine = ENGINES[engine_id]
-        self.status_label.setText(
-            f"{len(voices)} vozes de {engine.display_name} carregadas. Abra um arquivo ou cole um texto para começar."
-        )
-
-    def _apply_voice_catalog(self, voices: list[VoiceInfo]):
-        self.catalog = {}
-        for v in voices:
-            lang, country = parse_locale_name(v.locale_name, v.locale)
-            self.catalog.setdefault(lang, {}).setdefault(country, []).append(v)
-
-        self.language_combo.blockSignals(True)
-        self.language_combo.clear()
-        self.language_combo.addItems(sorted(self.catalog.keys()))
-        self.language_combo.blockSignals(False)
-
-        default_index = self.language_combo.findText("Portuguese")
-        self.language_combo.setCurrentIndex(max(default_index, 0))
-        self._on_language_changed()
+        tab = self._active_tab
+        if tab is None or engine_id != self.engine_combo.currentData():
+            return  # usuário já trocou de motor/aba antes desta lista chegar
+        self._syncing_controls = True
+        try:
+            self._fill_voice_combos(tab)
+        finally:
+            self._syncing_controls = False
+        self._on_controls_changed()
+        if not tab.has_document:
+            engine = ENGINES[engine_id]
+            tab.set_status(f"{len(voices)} vozes de {engine.display_name} carregadas. {READY_MESSAGE}")
+        else:
+            self.status_label.setText(tab.status_text)
 
     def _on_voices_failed(self, message: str):
         self.status_label.setText("Falha ao carregar vozes. Verifique sua conexão com a internet.")
         self.log_manager.log(f"Falha ao carregar vozes: {message}")
-        QMessageBox.critical(self, "Erro ao carregar vozes", message)
+        QMessageBox.critical(self, "Erro ao carregar vozes", summarize_error(message, limit=400))
 
-    def _on_language_changed(self):
-        lang = self.language_combo.currentText()
-        countries = sorted(self.catalog.get(lang, {}).keys())
-        self.country_combo.blockSignals(True)
-        self.country_combo.clear()
-        self.country_combo.addItems(countries)
-        self.country_combo.blockSignals(False)
-
-        default_index = self.country_combo.findText("Brazil")
-        if countries:
-            self.country_combo.setCurrentIndex(max(default_index, 0))
-        self._on_country_changed()
-
-    def _on_country_changed(self):
-        lang = self.language_combo.currentText()
-        country = self.country_combo.currentText()
-        voice_list = self.catalog.get(lang, {}).get(country, [])
-
-        self.voice_combo.blockSignals(True)
-        self.voice_combo.clear()
-        for v in voice_list:
-            label = f"{v.id} ({v.gender})" if v.gender != "N/A" else v.id
-            self.voice_combo.addItem(label, userData=v.id)
-        self.voice_combo.blockSignals(False)
-        self._on_voice_params_changed()
-
-    # ---------- File / paste loading ----------
-    def _on_open_file_clicked(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Abrir arquivo",
-            "",
-            "Documentos (*.pdf *.docx *.md *.txt);;Todos os arquivos (*)",
-        )
-        if not path:
-            return
-        try:
-            text = load_document(path)
-        except Exception as exc:  # noqa: BLE001
-            self.log_manager.log(f"Falha ao abrir arquivo '{path}': {exc}\n{traceback.format_exc()}")
-            QMessageBox.critical(self, "Erro ao abrir arquivo", str(exc))
-            return
-        if not text.strip():
-            QMessageBox.warning(self, "Arquivo vazio", "Não foi possível extrair texto desse arquivo.")
-            return
-        self._load_document_text(text)
-        self.setWindowTitle(f"TTS Reader — {path.rsplit('/', 1)[-1]}")
-
-    def _on_paste_text_clicked(self):
-        dialog = PasteTextDialog(self)
-        if dialog.exec():
-            text = dialog.get_text().strip()
-            if text:
-                self._load_document_text(text)
-                self.setWindowTitle("TTS Reader — Texto colado")
-
-    def _load_document_text(self, text: str):
-        self.is_playing_intent = False
-        self.waiting_index = None
-        self.player.stop()
-
-        self.full_text = text
-        self.sentences = split_sentences(text)
-        self.text_view.setPlainText(self.full_text)
-
-        self._reset_pipeline()
-
-        has_sentences = bool(self.sentences)
-        self.current_index = 0 if has_sentences else -1
-        for btn in (self.prev_btn, self.play_pause_btn, self.next_btn, self.restart_btn):
-            btn.setEnabled(has_sentences)
-
-        self._highlight_current(scroll=True)
-        self._update_progress_label()
-        self._update_play_button_label()
-        if has_sentences:
-            self._ensure_prefetch()
-            self.status_label.setText(f"Documento carregado: {len(self.sentences)} períodos. Pronto para ler.")
-        else:
-            self.status_label.setText("Nenhum período reconhecível foi encontrado no texto.")
-
-    # ---------- Pipeline ----------
-    def _reset_pipeline(self):
-        if self.pipeline is not None:
-            try:
-                self.pipeline.sentence_ready.disconnect(self._on_sentence_ready)
-                self.pipeline.sentence_failed.disconnect(self._on_sentence_failed)
-            except TypeError:
-                pass
-            self.pipeline.shutdown()
-
-        # Voz, velocidade ou texto novos: as durações medidas até aqui não valem mais.
-        self.estimator.reset([len(text.strip()) for text, _, _ in self.sentences], self.rate_slider.value())
-        self._playing_index = None
-        self._update_time_display()
-
-        engine = self._current_engine()
-        voice_id = self.voice_combo.currentData()
-        if engine is None or not voice_id:
-            self.pipeline = None
-            return
-
-        rate_percent = self.rate_slider.value()
-        pitch_hz = self.pitch_slider.value() if engine.supports_pitch else 0
-        self.pipeline = SentencePipeline(engine, voice_id, rate_percent, pitch_hz)
-        self.pipeline.sentence_ready.connect(self._on_sentence_ready)
-        self.pipeline.sentence_failed.connect(self._on_sentence_failed)
-
-    def _on_voice_params_changed(self):
-        if not self.sentences:
-            return
-        was_playing = self.is_playing_intent
-        self.player.stop()
-        self.waiting_index = None
-        self._reset_pipeline()
-        self._ensure_prefetch()
-        if was_playing:
-            self._play_current()
-
-    def _ensure_prefetch(self):
-        if self.pipeline is None or self.current_index < 0:
-            return
-        lo = max(0, self.current_index - 1)
-        hi = min(len(self.sentences) - 1, self.current_index + PREFETCH_AHEAD)
-        order = (
-            [self.current_index]
-            + list(range(self.current_index + 1, hi + 1))
-            + list(range(self.current_index - 1, lo - 1, -1))
-        )
-        seen = set()
-        for idx in order:
-            if idx < 0 or idx >= len(self.sentences) or idx in seen:
-                continue
-            seen.add(idx)
-            self.pipeline.request(idx, self.sentences[idx][0])
-
-    def _on_sentence_ready(self, index: int, path: str):
-        if index == self.waiting_index:
+    # ---------- Áudio gerado ----------
+    def _on_sentence_ready(self, tab: ReaderTab, index: int, path: str):
+        if tab is self._active_tab and index == self.waiting_index:
             self.waiting_index = None
-            self._play_path(path)
+            self._play_path(tab, path)
 
-    def _on_sentence_failed(self, index: int, message: str):
-        self.log_manager.log(f"Falha ao gerar período {index + 1}: {message}")
-        if index != self.current_index:
+    def _on_sentence_failed(self, tab: ReaderTab, index: int, message: str):
+        self.log_manager.log(f"[{tab.title}] Falha ao gerar período {index + 1}: {message}")
+        if index != tab.current_index:
+            return
+        engine = ENGINES.get(tab.settings.engine_id)
+        engine_name = engine.display_name if engine else ""
+        tab.set_status(f"Falha ao gerar período {index + 1}. {summarize_error(message, engine_name)}")
+        if tab is not self._active_tab:
             return
         was_waiting = self.waiting_index == index
         self.waiting_index = None
-        engine = self._current_engine()
-        engine_name = engine.display_name if engine else ""
-        self.status_label.setText(f"Falha ao gerar período {index + 1}. {summarize_error(message, engine_name)}")
         self._update_play_button_label()
         # Só interrompe com um aviso se o usuário estava esperando o áudio.
         if was_waiting and engine is not None:
@@ -771,34 +930,46 @@ class MainWindow(QMainWindow):
         self.engine_combo.setCurrentIndex(self.engine_combo.findData(target_id))
 
     # ---------- Playback ----------
+    def _stop_playback(self):
+        self.is_playing_intent = False
+        self.waiting_index = None
+        self.player.stop()
+        self._playing_index = None
+        self._update_play_button_label()
+
     def _play_current(self):
-        if self.pipeline is None or self.current_index < 0:
+        tab = self._active_tab
+        if tab is None or tab.pipeline is None or tab.current_index < 0:
             return
-        if self.pipeline.is_cached(self.current_index):
-            self._play_path(self.pipeline.path_for(self.current_index))
+        if tab.pipeline.is_cached(tab.current_index):
+            self._play_path(tab, tab.pipeline.path_for(tab.current_index))
         else:
-            self.waiting_index = self.current_index
-            self.status_label.setText(f"Carregando período {self.current_index + 1}...")
-            self.pipeline.request(self.current_index, self.sentences[self.current_index][0])
+            self.waiting_index = tab.current_index
+            tab.set_status(f"Carregando período {tab.current_index + 1}...")
+            tab.pipeline.request(tab.current_index, tab.sentences[tab.current_index][0])
             self._update_play_button_label()
 
-    def _play_path(self, path: str):
+    def _play_path(self, tab: ReaderTab, path: str):
         self.player.stop()
-        self._playing_index = self.current_index
+        self._playing_tab = tab
+        self._playing_index = tab.current_index
         self.player.setSource(QUrl.fromLocalFile(path))
         self.player.play()
-        self.status_label.setText(f"Lendo período {self.current_index + 1} de {len(self.sentences)}")
+        tab.set_status(f"Lendo período {tab.current_index + 1} de {len(tab.sentences)}")
         self._update_play_button_label()
 
     def _record_loaded_duration(self):
         """Guarda a duração real do áudio carregado para refinar a estimativa."""
-        index = self._playing_index
+        tab, index = self._playing_tab, self._playing_index
         duration = self.player.duration()
+        if tab is None or tab is not self._active_tab or tab.pipeline is None:
+            return
         if index is None or duration <= 0:
             return
-        loaded_file = os.path.basename(self.player.source().toLocalFile())
-        if loaded_file.startswith(f"{index:06d}"):  # garante que o áudio é mesmo deste período
-            self.estimator.record_duration(index, duration)
+        source = os.path.normcase(os.path.normpath(self.player.source().toLocalFile()))
+        expected = os.path.normcase(os.path.normpath(tab.pipeline.path_for(index)))
+        if source == expected:  # garante que o áudio é mesmo deste período desta aba
+            tab.estimator.record_duration(index, duration)
             self._update_time_display()
 
     def _on_position_changed(self, _position: int):
@@ -807,13 +978,15 @@ class MainWindow(QMainWindow):
 
     def _update_time_display(self):
         self._last_time_update = time.monotonic()
-        if self.current_index < 0 or not self.sentences:
+        tab = self._active_tab
+        if tab is None or tab.current_index < 0 or not tab.sentences:
             self.time_label.setText("⏱ Restante: --:--")
             self.eta_label.setText("")
             return
-        position = self.player.position() if self._playing_index == self.current_index else 0
-        remaining = self.estimator.remaining_ms(self.current_index, position)
-        total = self.estimator.total_ms()
+        playing_here = self._playing_tab is tab and self._playing_index == tab.current_index
+        position = self.player.position() if playing_here else 0
+        remaining = tab.estimator.remaining_ms(tab.current_index, position)
+        total = tab.estimator.total_ms()
         self.time_label.setText(
             f"⏱ Restante: {format_duration(remaining)} (de ~{format_duration(total)})"
         )
@@ -828,23 +1001,26 @@ class MainWindow(QMainWindow):
     def _on_media_status_changed(self, status):
         if status in (QMediaPlayer.MediaStatus.LoadedMedia, QMediaPlayer.MediaStatus.BufferedMedia):
             self._record_loaded_duration()
-        if status == QMediaPlayer.MediaStatus.EndOfMedia and self.is_playing_intent:
+        if status == QMediaPlayer.MediaStatus.EndOfMedia and self.is_playing_intent and self._active_tab:
             # O Qt pode avisar o fim antes do áudio terminar de sair pelo alto-falante;
             # trocar de período na hora cortaria o final da frase.
-            index = self.current_index
-            QTimer.singleShot(SENTENCE_END_DELAY_MS, lambda: self._advance_after_end(index))
+            tab, index = self._active_tab, self._active_tab.current_index
+            QTimer.singleShot(SENTENCE_END_DELAY_MS, lambda: self._advance_after_end(tab, index))
 
-    def _advance_after_end(self, finished_index: int):
-        if self.is_playing_intent and self.current_index == finished_index:
+    def _advance_after_end(self, tab: ReaderTab, finished_index: int):
+        if self.is_playing_intent and tab is self._active_tab and tab.current_index == finished_index:
             self._go_next()
 
     def _on_player_error(self, error, error_string: str):
-        if error != QMediaPlayer.Error.NoError:
-            self.status_label.setText(f"Erro de reprodução: {error_string}")
-            self.log_manager.log(f"Erro de reprodução (período {self.current_index + 1}): {error_string}")
+        if error != QMediaPlayer.Error.NoError and self._active_tab is not None:
+            self._active_tab.set_status(f"Erro de reprodução: {error_string}")
+            self.log_manager.log(
+                f"Erro de reprodução (período {self._active_tab.current_index + 1}): {error_string}"
+            )
 
     def _toggle_play_pause(self):
-        if self.current_index < 0:
+        tab = self._active_tab
+        if tab is None or tab.current_index < 0:
             return
         if self.is_playing_intent:
             self.is_playing_intent = False
@@ -854,6 +1030,8 @@ class MainWindow(QMainWindow):
             if (
                 self.player.playbackState() == QMediaPlayer.PlaybackState.PausedState
                 and self.player.source().isValid()
+                and self._playing_tab is tab
+                and self._playing_index == tab.current_index
             ):
                 self.player.play()
             else:
@@ -869,89 +1047,50 @@ class MainWindow(QMainWindow):
             self.play_pause_btn.setText("▶ Play")
         self._update_time_display()
 
-    # ---------- Navigation ----------
-    def _go_next(self):
-        if self.current_index < 0:
+    # ---------- Navegação ----------
+    def _jump_to(self, index: int, scroll: bool = True):
+        tab = self._active_tab
+        if tab is None or not 0 <= index < len(tab.sentences):
             return
-        if self.current_index + 1 >= len(self.sentences):
-            self.is_playing_intent = False
-            self.waiting_index = None
-            self.player.stop()
-            self.status_label.setText("Fim do documento.")
-            self._update_play_button_label()
-            return
-        self.current_index += 1
+        tab.current_index = index
         self.waiting_index = None
-        self._highlight_current(scroll=True)
+        tab.highlight_current(scroll=scroll)
         self._update_progress_label()
-        self._ensure_prefetch()
+        tab.ensure_prefetch(PREFETCH_AHEAD)
         if self.is_playing_intent:
             self._play_current()
         else:
             self.player.stop()
+            self._playing_index = None
+            self._update_play_button_label()
+
+    def _go_next(self):
+        tab = self._active_tab
+        if tab is None or tab.current_index < 0:
+            return
+        if tab.current_index + 1 >= len(tab.sentences):
+            self._stop_playback()
+            tab.set_status("Fim do documento.")
+            return
+        self._jump_to(tab.current_index + 1)
 
     def _go_previous(self):
-        if self.current_index <= 0:
-            return
-        self.current_index -= 1
-        self.waiting_index = None
-        self._highlight_current(scroll=True)
-        self._update_progress_label()
-        self._ensure_prefetch()
-        if self.is_playing_intent:
-            self._play_current()
-        else:
-            self.player.stop()
+        tab = self._active_tab
+        if tab is not None and tab.current_index > 0:
+            self._jump_to(tab.current_index - 1)
 
     def _on_restart(self):
-        if not self.sentences:
-            return
-        self.current_index = 0
-        self.waiting_index = None
-        self._highlight_current(scroll=True)
-        self._update_progress_label()
-        self._ensure_prefetch()
-        if self.is_playing_intent:
-            self._play_current()
-        else:
-            self.player.stop()
+        self._jump_to(0)
 
-    # ---------- Highlight / auto-scroll (estilo teleprompter) ----------
-    def _highlight_current(self, scroll: bool = True):
-        if self.current_index < 0 or self.current_index >= len(self.sentences):
-            self.text_view.setExtraSelections([])
-            return
-
-        _, start, end = self.sentences[self.current_index]
-
-        cursor = self.text_view.textCursor()
-        cursor.setPosition(start)
-        cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
-
-        fmt = QTextCharFormat()
-        fmt.setBackground(self.theme.highlight_color)
-        selection = QTextEdit.ExtraSelection()
-        selection.format = fmt
-        selection.cursor = cursor
-        self.text_view.setExtraSelections([selection])
-
-        if scroll:
-            # Adiado para o próximo tick: garante que o layout do documento
-            # já esteja calculado antes de medirmos a posição do cursor.
-            QTimer.singleShot(0, lambda pos=start: self._scroll_sentence_to_top(pos))
-
-    def _scroll_sentence_to_top(self, char_pos: int):
-        cursor = QTextCursor(self.text_view.document())
-        cursor.setPosition(char_pos)
-        rect = self.text_view.cursorRect(cursor)
-        scrollbar = self.text_view.verticalScrollBar()
-        new_value = scrollbar.value() + rect.y() - SCROLL_TOP_MARGIN
-        new_value = max(scrollbar.minimum(), min(scrollbar.maximum(), new_value))
-        scrollbar.setValue(new_value)
+    def _on_sentence_clicked(self, tab: ReaderTab, index: int):
+        # O período clicado já está à vista: não rola a tela debaixo do mouse.
+        if tab is self._active_tab:
+            self._jump_to(index, scroll=False)
 
     def _update_progress_label(self):
-        total = len(self.sentences)
-        idx = self.current_index + 1 if self.current_index >= 0 else 0
+        tab = self._active_tab
+        total = len(tab.sentences) if tab else 0
+        idx = tab.current_index + 1 if tab and tab.current_index >= 0 else 0
         self.progress_bar.setMaximum(max(total, 1))
         self.progress_bar.setValue(idx)
         self.position_label.setText(f"Período {idx} / {total}")
@@ -959,11 +1098,13 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self.is_playing_intent = False
+        self.player.stop()
         self.update_manager.shutdown()
         self.audio_keepalive.set_enabled(False)
         self.ocr_widget.shutdown()
-        if self.pipeline is not None:
-            self.pipeline.shutdown()
+        for tab in self._all_tabs():
+            tab.shutdown()
+        wait_for_loaders(3000)
         for thread in list(self._voice_threads):
             if thread.isRunning():
                 thread.wait(2000)

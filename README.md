@@ -2,7 +2,7 @@
 
 Aplicativo desktop com duas áreas integradas:
 
-- **Leitor TTS:** abre PDF, DOCX, Markdown e TXT, divide o texto em períodos e usa vozes Edge, Piper ou gTTS.
+- **Leitor TTS:** abre PDF, DOCX, Markdown e TXT, divide o texto em períodos e usa vozes Edge, Piper ou gTTS. Cada documento abre numa aba própria, com voz, velocidade e posição de leitura independentes. PDFs são exibidos como PDF, com o período lido destacado sobre a página; passe o mouse sobre um período e clique para pular direto para ele.
 - **OCR de alta qualidade:** extrai PDFs e imagens com Tesseract, reaproveita automaticamente camadas de texto confiáveis e envia o resultado ao leitor.
 
 ## OCR adaptativo

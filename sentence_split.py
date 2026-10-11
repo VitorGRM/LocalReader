@@ -13,6 +13,10 @@ ABBREVIATIONS = {
 }
 
 _BOUNDARY_RE = re.compile(r"[.!?…]+[\"'”’)\]]*")
+_LAST_WORD_RE = re.compile(r"(\S+)$")
+# Só a palavra antes do ponto importa; olhar um trecho curto (e não o texto
+# inteiro até ali) evita tempo quadrático em livros longos.
+_LOOKBEHIND = 64
 
 
 def _is_false_positive(text: str, match: re.Match) -> bool:
@@ -22,15 +26,17 @@ def _is_false_positive(text: str, match: re.Match) -> bool:
     # Decimal number: "3.14" — char before the dot and char right after the
     # punctuation run are both digits.
     if punct_text == "." and punct_start > 0:
-        rest = text[match.end():]
-        if text[punct_start - 1].isdigit() and rest and rest[0].isdigit():
+        after = match.end()
+        if text[punct_start - 1].isdigit() and after < len(text) and text[after].isdigit():
             return True
 
     # Abbreviation / initials check — only relevant for a single trailing dot.
     if punct_text == ".":
-        preceding = text[:punct_start]
-        word_match = re.search(r"(\S+)$", preceding)
-        if word_match:
+        window_start = max(0, punct_start - _LOOKBEHIND)
+        preceding = text[window_start:punct_start]
+        word_match = _LAST_WORD_RE.search(preceding)
+        # Palavra maior que a janela: não é abreviação nem inicial.
+        if word_match and (word_match.start() > 0 or window_start == 0):
             word = word_match.group(1).lower()
             if word + "." in ABBREVIATIONS or word in ABBREVIATIONS:
                 return True
