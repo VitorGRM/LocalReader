@@ -83,6 +83,30 @@ class PdfLayout:
             return self.words.pages[i], self.words.rect(i)
         return None
 
+    def word_near(self, page: int, x: float, y: float) -> int | None:
+        """Índice da palavra da página mais próxima do ponto (x, y), para a seleção com o mouse."""
+        first = bisect_left(self.words.pages, page)
+        last = bisect_right(self.words.pages, page)
+        best, best_dist = None, 0.0
+        for i in range(first, last):
+            x0, y0, x1, y1 = self.words.rect(i)
+            dx = max(x0 - x, 0.0, x - x1)
+            dy = max(y0 - y, 0.0, y - y1)
+            dist = dx + 3 * dy  # prefere palavras da mesma linha
+            if best is None or dist < best_dist:
+                best, best_dist = i, dist
+        return best
+
+    def words_text(self, first: int, last: int) -> str:
+        """Texto da palavra ``first`` até a ``last`` (em qualquer ordem), com as quebras de linha."""
+        first, last = min(first, last), max(first, last)
+        return self.text[self.words.starts[first]:self.words.ends[last]]
+
+    def words_rects(self, first: int, last: int) -> list[tuple[int, Rect]]:
+        """Retângulos (um por linha) da palavra ``first`` até a ``last`` (em qualquer ordem)."""
+        first, last = min(first, last), max(first, last)
+        return _rects_for_range(self.words, self.words.starts[first], self.words.ends[last])
+
 
 def _page_words(page: pymupdf.Page):
     """(bloco, linha, texto, retângulo) de cada palavra, na ordem de leitura do PyMuPDF."""

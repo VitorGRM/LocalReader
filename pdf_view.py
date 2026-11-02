@@ -9,16 +9,18 @@ from bisect import bisect_right
 
 import pymupdf
 from PyQt6.QtCore import QPoint, QPointF, QRectF, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QBrush, QColor, QImage, QPainter, QPen, QPixmap, QTransform
+from PyQt6.QtGui import QBrush, QColor, QCursor, QImage, QKeySequence, QPainter, QPen, QPixmap, QTransform
 from PyQt6.QtWidgets import (
+    QApplication,
     QGraphicsPixmapItem,
     QGraphicsRectItem,
     QGraphicsScene,
     QGraphicsView,
+    QMenu,
 )
 
 from pdf_layout import PdfLayout
-from theme import PDF_HIGHLIGHT, PDF_HOVER, PDF_WORD
+from theme import PDF_HIGHLIGHT, PDF_HOVER, PDF_SELECTION, PDF_WORD
 
 PAGE_GAP = 14.0  # pontos entre páginas
 SCENE_PAD = 14.0
@@ -29,6 +31,7 @@ RENDER_AHEAD_VIEWPORTS = 1.5  # pré-desenha esta distância acima e abaixo da t
 KEEP_VIEWPORTS = 8  # páginas mais longe que isso liberam a memória
 CLICK_SLOP_PX = 5
 HIGHLIGHT_PAD = 1.2
+AUTOSCROLL_MS = 30  # rolagem ao arrastar a seleção para fora da tela
 
 
 class _Page:
@@ -79,6 +82,14 @@ class PdfView(QGraphicsView):
         self._current_items: list[QGraphicsRectItem] = []
         self._hover_items: list[QGraphicsRectItem] = []
         self._press_pos: QPoint | None = None
+        # Seleção de texto: índices de palavra no layout (âncora e ponta arrastada).
+        self._drag_anchor: int | None = None
+        self._dragging = False
+        self._selection: tuple[int, int] | None = None
+        self._selection_items: list[QGraphicsRectItem] = []
+        self._autoscroll_timer = QTimer(self)
+        self._autoscroll_timer.setInterval(AUTOSCROLL_MS)
+        self._autoscroll_timer.timeout.connect(self._autoscroll)
 
         self._render_timer = QTimer(self)
         self._render_timer.setSingleShot(True)
@@ -108,8 +119,13 @@ class PdfView(QGraphicsView):
 
     def close_document(self) -> None:
         self._render_timer.stop()
+        self._autoscroll_timer.stop()
         self._current_items.clear()
         self._hover_items.clear()
+        self._selection_items.clear()
+        self._selection = None
+        self._drag_anchor = None
+        self._dragging = False
         self._scene.clear()
         self._pages.clear()
         self._page_tops.clear()
@@ -268,23 +284,106 @@ class PdfView(QGraphicsView):
         target_center_y = rect.top() + visible.height() * 0.25
         self.centerOn(QPointF(visible.center().x(), target_center_y))
 
+    # ---------- Seleção de texto ----------
+    def has_selection(self) -> bool:
+        return self._selection is not None
+
+    def selected_text(self) -> str:
+        if self._selection is None or self._layout is None:
+            return ""
+        return self._layout.words_text(*self._selection)
+
+    def _set_selection(self, selection: tuple[int, int] | None) -> None:
+        if selection == self._selection:
+            return
+        self._selection = selection
+        self._remove_items(self._selection_items)
+        if selection is not None and self._layout is not None:
+            self._selection_items = [
+                self._add_rect(page_no, rect, PDF_SELECTION, 4) for page_no, rect in self._layout.words_rects(*selection)
+            ]
+
+    def clear_selection(self) -> None:
+        self._set_selection(None)
+
+    def select_all(self) -> None:
+        if self._layout is not None and len(self._layout.words):
+            self._set_selection((0, len(self._layout.words) - 1))
+
+    def copy_selection(self) -> None:
+        text = self.selected_text()
+        if text:
+            QApplication.clipboard().setText(text)
+
+    def _word_at(self, pos: QPoint, clamp: bool = False) -> int | None:
+        """Palavra mais próxima do ponto. Com ``clamp``, vale também fora das páginas
+        (a ponta da seleção pode ser arrastada para as margens e entre páginas)."""
+        found = self._page_point(pos, clamp)
+        if found is None:
+            return None
+        return self._layout.word_near(*found)
+
+    def _extend_selection(self, pos: QPoint) -> None:
+        end = self._word_at(pos, clamp=True)
+        if end is not None and self._drag_anchor is not None:
+            self._set_selection((self._drag_anchor, end))
+
+    def _autoscroll(self) -> None:
+        if not self._dragging:
+            self._autoscroll_timer.stop()
+            return
+        pos = self.viewport().mapFromGlobal(QCursor.pos())
+        rect = self.viewport().rect()
+        if pos.y() < rect.top():
+            delta = pos.y() - rect.top()
+        elif pos.y() > rect.bottom():
+            delta = pos.y() - rect.bottom()
+        else:
+            return
+        bar = self.verticalScrollBar()
+        bar.setValue(bar.value() + delta)
+        self._extend_selection(pos)
+
     # ---------- Mouse / teclado ----------
-    def _sentence_at(self, pos: QPoint) -> int | None:
+    def _page_point(self, pos: QPoint, clamp: bool = False) -> tuple[int, float, float] | None:
+        """(página, x, y) em pontos da página sob ``pos``; com ``clamp``, a página mais próxima."""
         if self._layout is None or not self._pages:
             return None
         point = self.mapToScene(pos)
         page_no = bisect_right(self._page_tops, point.y()) - 1
         if page_no < 0:
-            return None
+            if not clamp:
+                return None
+            page_no = 0
         page = self._pages[page_no]
         x, y = point.x() - page.x, point.y() - page.top
-        if not (0 <= x <= page.width and 0 <= y <= page.height):
+        if not clamp and not (0 <= x <= page.width and 0 <= y <= page.height):
             return None
-        return self._layout.sentence_at(page_no, x, y)
+        return page_no, x, y
+
+    def _sentence_at(self, pos: QPoint) -> int | None:
+        found = self._page_point(pos)
+        if found is None:
+            return None
+        return self._layout.sentence_at(*found)
 
     def mouseMoveEvent(self, event):
         super().mouseMoveEvent(event)
-        self._set_hover(self._sentence_at(event.position().toPoint()))
+        pos = event.position().toPoint()
+        if self._press_pos is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            if (
+                not self._dragging
+                and self._drag_anchor is not None
+                and (pos - self._press_pos).manhattanLength() > CLICK_SLOP_PX
+            ):
+                self._dragging = True
+                self._set_hover(None)
+                self.viewport().setCursor(Qt.CursorShape.IBeamCursor)
+                self._autoscroll_timer.start()
+            if self._dragging:
+                self._extend_selection(pos)
+            return
+        self._set_hover(self._sentence_at(pos))
 
     def leaveEvent(self, event):
         self._set_hover(None)
@@ -292,7 +391,11 @@ class PdfView(QGraphicsView):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            self._press_pos = event.position().toPoint()
+            pos = event.position().toPoint()
+            self._press_pos = pos
+            self._dragging = False
+            self._drag_anchor = self._word_at(pos)
+            self.clear_selection()
         super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event):
@@ -301,11 +404,42 @@ class PdfView(QGraphicsView):
             return
         pos = event.position().toPoint()
         moved = (pos - self._press_pos).manhattanLength()
+        dragged = self._dragging
         self._press_pos = None
-        if moved <= CLICK_SLOP_PX:
+        self._dragging = False
+        self._autoscroll_timer.stop()
+        if dragged:
+            self.viewport().setCursor(Qt.CursorShape.ArrowCursor)
+            self._set_hover(self._sentence_at(pos))
+        elif moved <= CLICK_SLOP_PX:
             index = self._sentence_at(pos)
             if index is not None:
                 self.sentence_clicked.emit(index)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() != Qt.MouseButton.LeftButton:
+            super().mouseDoubleClickEvent(event)
+            return
+        # Como no texto plano: duplo clique seleciona a palavra.
+        self._press_pos = None
+        word = self._word_at(event.position().toPoint())
+        if word is not None:
+            self._set_selection((word, word))
+        event.accept()
+
+    def contextMenuEvent(self, event):
+        if self._layout is None:
+            super().contextMenuEvent(event)
+            return
+        menu = QMenu(self)
+        copy_action = menu.addAction("Copiar")
+        copy_action.setShortcut(QKeySequence(QKeySequence.StandardKey.Copy))
+        copy_action.setEnabled(self.has_selection())
+        copy_action.triggered.connect(self.copy_selection)
+        select_all_action = menu.addAction("Selecionar tudo")
+        select_all_action.setShortcut(QKeySequence(QKeySequence.StandardKey.SelectAll))
+        select_all_action.triggered.connect(self.select_all)
+        menu.exec(event.globalPos())
 
     def wheelEvent(self, event):
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
@@ -318,7 +452,13 @@ class PdfView(QGraphicsView):
 
     def keyPressEvent(self, event):
         key = event.key()
-        if key == Qt.Key.Key_Up:
+        if event.matches(QKeySequence.StandardKey.Copy):
+            self.copy_selection()
+        elif event.matches(QKeySequence.StandardKey.SelectAll):
+            self.select_all()
+        elif key == Qt.Key.Key_Escape and self.has_selection():
+            self.clear_selection()
+        elif key == Qt.Key.Key_Up:
             self.navigate_prev.emit()
         elif key == Qt.Key.Key_Down:
             self.navigate_next.emit()

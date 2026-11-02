@@ -66,11 +66,36 @@ class PdfLayoutTest(unittest.TestCase):
         self.assertGreater(x0, first[2] - 1)  # "frase" fica à direita de "Primeira"
         self.assertIsNone(layout.word_rect_at(offset + 1))  # meio de palavra
 
+    def test_word_near_and_selection_text(self):
+        _make_pdf(self.path, [[(60, "Primeira frase aqui."), (80, "Outra linha.")], [(60, "Segunda pagina.")]])
+        layout = extract_pdf_layout(self.path)
+        frase = layout.text.index("frase")
+        _, (x0, y0, x1, y1) = layout.word_rect_at(frase)
+        middle = layout.word_near(0, (x0 + x1) / 2, (y0 + y1) / 2)
+        self.assertEqual(layout.words.starts[middle], frase)
+        # Fora do texto: fica com a palavra mais próxima da mesma linha.
+        last_in_line = layout.word_near(0, 390, (y0 + y1) / 2)
+        self.assertEqual(layout.text[layout.words.starts[last_in_line]:layout.words.ends[last_in_line]], "aqui.")
+        self.assertIsNone(layout.word_near(5, 10, 10))  # página inexistente
+
+        linha = layout.word_near(0, 390, 300)  # abaixo e à direita de tudo: fim da última linha
+        self.assertRegex(layout.words_text(middle, linha), r"^frase aqui\.\n+Outra linha\.$")
+        self.assertEqual(layout.words_text(linha, middle), layout.words_text(middle, linha))  # arrastando para trás
+        self.assertEqual(len(layout.words_rects(middle, linha)), 2)  # um retângulo por linha
+
+        segunda = layout.word_near(1, 40, 50)
+        self.assertEqual(layout.words.pages[segunda], 1)
+        self.assertEqual(
+            {page for page, _ in layout.words_rects(middle, segunda + 1)}, {0, 1}
+        )
+        self.assertTrue(layout.words_text(middle, segunda + 1).endswith("Segunda pagina."))
+
     def test_pdf_without_text(self):
         _make_pdf(self.path, [[]])
         layout = extract_pdf_layout(self.path)
         self.assertEqual(layout.sentences, [])
         self.assertEqual(len(layout.page_sizes), 1)
+        self.assertIsNone(layout.word_near(0, 10, 10))
 
     def test_cancel(self):
         from pdf_layout import LoadCancelled

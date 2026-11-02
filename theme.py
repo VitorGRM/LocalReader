@@ -44,6 +44,7 @@ _DARK_COLORS = {
 PDF_HIGHLIGHT = QColor(255, 196, 0, 95)
 PDF_HOVER = QColor(60, 120, 230, 45)
 PDF_WORD = QColor(255, 130, 0, 110)
+PDF_SELECTION = QColor(0, 110, 230, 75)
 
 
 def _dark_palette() -> QPalette:
