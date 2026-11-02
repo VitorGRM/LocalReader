@@ -1,5 +1,7 @@
 """Ajustes de plataforma para rodar empacotado (PyInstaller) e no Windows."""
 import os
+import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -52,3 +54,20 @@ def setup_bundled_tools() -> Path | None:
                 os.environ.setdefault("TESSDATA_PREFIX", str(tessdata))
         return directory
     return None
+
+
+def available_tesseract_languages() -> list[str]:
+    """Retorna os modelos realmente instalados, sem incluir o modelo OSD."""
+    executable = shutil.which("tesseract")
+    if not executable:
+        return []
+    try:
+        completed = subprocess.run(
+            [executable, "--list-langs"], capture_output=True, text=True, timeout=15, check=False,
+            **SUBPROCESS_KWARGS,
+        )
+        lines = (completed.stdout + "\n" + completed.stderr).splitlines()
+        langs = [line.strip() for line in lines if re.fullmatch(r"[A-Za-z0-9_]+", line.strip())]
+        return sorted({lang for lang in langs if lang != "osd"})
+    except (OSError, subprocess.SubprocessError):
+        return []

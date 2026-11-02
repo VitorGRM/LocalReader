@@ -20,11 +20,11 @@ from typing import Callable
 
 import pymupdf
 
-from ocr_engine import MAX_RENDER_PIXELS, available_tesseract_languages
 from pdf_cleanup import Token
-from platform_support import SUBPROCESS_KWARGS, app_data_dir
+from platform_support import SUBPROCESS_KWARGS, app_data_dir, available_tesseract_languages
 
 OCR_DPI = 300
+MAX_RENDER_PIXELS = 80_000_000
 PREFERRED_LANGUAGES = ("por", "eng")
 MIN_CONFIDENCE = 30  # abaixo disso, só fica a palavra que tem letras ou números
 PAGE_TIMEOUT_S = 300

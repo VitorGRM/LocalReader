@@ -34,11 +34,11 @@ from ocr_engine import (
     OCRProcessor,
     OCRResult,
     OCRSettings,
-    available_tesseract_languages,
     create_searchable_pdf,
     export_docx,
     language_label,
 )
+from platform_support import available_tesseract_languages
 
 
 class OCRWorker(QThread):

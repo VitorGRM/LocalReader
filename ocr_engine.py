@@ -110,23 +110,6 @@ class OCRResult:
         return sum(values) / len(values) if values else None
 
 
-def available_tesseract_languages() -> list[str]:
-    """Retorna os modelos realmente instalados, sem incluir o modelo OSD."""
-    executable = shutil.which("tesseract")
-    if not executable:
-        return []
-    try:
-        completed = subprocess.run(
-            [executable, "--list-langs"], capture_output=True, text=True, timeout=15, check=False,
-            **SUBPROCESS_KWARGS,
-        )
-        lines = (completed.stdout + "\n" + completed.stderr).splitlines()
-        langs = [line.strip() for line in lines if re.fullmatch(r"[A-Za-z0-9_]+", line.strip())]
-        return sorted({lang for lang in langs if lang != "osd"})
-    except (OSError, subprocess.SubprocessError):
-        return []
-
-
 def language_label(code: str) -> str:
     return f"{LANGUAGE_NAMES.get(code, code)} ({code})"
 
