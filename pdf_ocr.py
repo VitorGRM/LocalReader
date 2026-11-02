@@ -28,6 +28,7 @@ MAX_RENDER_PIXELS = 80_000_000
 PREFERRED_LANGUAGES = ("por", "eng")
 MIN_CONFIDENCE = 30  # abaixo disso, só fica a palavra que tem letras ou números
 PAGE_TIMEOUT_S = 300
+OCR_SECONDS_PER_PAGE = 5.0  # por página e por processo (uma thread), para estimar o tempo
 _CACHE_VERSION = 1
 
 
@@ -37,6 +38,10 @@ class OcrCancelled(Exception):
 
 def tesseract_available() -> bool:
     return shutil.which("tesseract") is not None
+
+
+def default_workers() -> int:
+    return max(1, min(6, (os.cpu_count() or 2) // 2))  # um processo por núcleo físico, até 6
 
 
 def choose_languages() -> str:
@@ -185,7 +190,7 @@ def ocr_pages(
     if not pending_pages or not tesseract_available():
         return results
 
-    workers = workers or max(1, min(4, (os.cpu_count() or 2) // 2))
+    workers = workers or default_workers()
     tesseract = _Tesseract(choose_languages())
     running: dict = {}
     pool = ThreadPoolExecutor(max_workers=workers)

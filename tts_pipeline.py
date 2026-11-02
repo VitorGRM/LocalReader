@@ -78,7 +78,9 @@ class SentencePipeline(QObject):
             if key in self._pending or key in self._inflight or self.is_cached(index, start):
                 return
             self._pending.add(key)
-        asyncio.run_coroutine_threadsafe(self._synth(index, start, text[start:]), self._loop)
+        # Quebras de linha do texto (comuns em PDFs) não devem virar pausas na voz.
+        spoken = " ".join(text[start:].split())
+        asyncio.run_coroutine_threadsafe(self._synth(index, start, spoken), self._loop)
 
     async def _synth(self, index: int, start: int, text: str) -> None:
         key = (index, start)

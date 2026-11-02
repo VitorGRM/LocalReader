@@ -699,6 +699,15 @@ class MainWindow(QMainWindow):
                 else "o Tesseract (OCR) não está instalado"
             )
             ocr_note += f" {len(layout.ocr_missing_pages)} página(s) digitalizada(s) ficaram sem texto: {reason}."
+        if (
+            layout is not None
+            and layout.scanned_text_pages >= max(1, len(layout.page_sizes) // 2)
+            and not layout.ocr_pages
+        ):
+            ocr_note += (
+                " Este PDF é digitalizado e o texto veio de um OCR antigo; se a leitura tiver"
+                " erros, use ⋯ → Refazer o OCR deste PDF."
+            )
         if tab.sentences:
             tab.set_status(f"Documento carregado: {len(tab.sentences)} períodos. Pronto para ler.{ocr_note}")
         elif tab.kind == "pdf":

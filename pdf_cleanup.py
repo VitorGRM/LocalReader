@@ -23,6 +23,12 @@ TITLE_RATIO = 1.3  # linha bem maior que o corpo é título, não cabeçalho cor
 HEADING_RATIO = 1.2  # título colado ao parágrafo: fonte bem maior que a linha seguinte
 NOTE_SIZE_RATIO = 0.92  # notas usam fonte menor que o corpo
 NOTE_REGION = 0.5  # notas começam na metade de baixo da página
+# Reconstrução das linhas (medidas em alturas de linha).
+LINE_OVERLAP = 0.5  # palavras da mesma linha se sobrepõem na vertical
+WORD_GAP = 2.5  # espaço máximo entre palavras vizinhas da mesma linha
+PARAGRAPH_GAP = 0.6  # espaço entre linhas que separa parágrafos
+INDENT = 0.8  # recuo da primeira linha do parágrafo
+SHORT_LINE = 2.0  # linha que termina antes da margem direita fecha o parágrafo
 
 _PAGE_NUMBER_RE = re.compile(
     r"^[\W_]*(?:p[áa]g(?:ina)?\.?\s*|p\.\s*|page\s*)?(?:\d{1,4}|[ivxlcdm]{1,7})"
@@ -34,8 +40,8 @@ _TRAILING_SUP_RE = re.compile(rf"(?:(?<=[^\W\d_]{{2}})|(?<=[.,;:!?\"'”’)\]])
 _LEADING_SUP_RE = re.compile(rf"^[{_UNICODE_SUP}]+(?=\S)")
 _ONLY_SUP_RE = re.compile(rf"^[{_UNICODE_SUP}]+$")
 
-HYPHENS = "-‐‑"
-SOFT_HYPHEN = "­"
+HYPHENS = "-\u2010\u2011"  # hífen, hífen Unicode e hífen inseparável
+SOFT_HYPHEN = "\u00ad"
 SENTENCE_END = ".!?…:;\"'”’»)]"
 # Pronomes que seguem o hífen do verbo ("disse-lhe"): o hífen é da palavra.
 CLITICS = {
@@ -77,6 +83,53 @@ def _box(line: list[Token]) -> Rect:
 
 def _height(tokens: list[Token]) -> float:
     return median(t.rect[3] - t.rect[1] for t in tokens) if tokens else 0.0
+
+
+def _same_line(a: Rect, b: Rect) -> bool:
+    height = min(a[3] - a[1], b[3] - b[1])
+    overlap = min(a[3], b[3]) - max(a[1], b[1])
+    distance = max(b[0] - a[2], a[0] - b[2])  # vale também para texto da direita para a esquerda
+    return overlap >= LINE_OVERLAP * height and distance <= WORD_GAP * max(a[3] - a[1], b[3] - b[1])
+
+
+def rebuild_lines(tokens: list[Token]) -> None:
+    """Refaz linhas e parágrafos pela posição das palavras na página.
+
+    A camada de texto de OCRs antigos (comum em livros digitalizados, como os do
+    Internet Archive) parte uma linha visual em vários pedaços e põe cada linha
+    num bloco próprio; confiar nela põe quebras de linha entre palavras e corta
+    frases em toda troca de bloco. Aqui, palavras vizinhas que se sobrepõem na
+    vertical formam uma linha, e um parágrafo novo começa quando há mais espaço
+    entre as linhas, recuo na primeira linha, mudança de coluna ou depois de uma
+    linha que termina antes da margem direita.
+    """
+    lines: list[list[Token]] = []
+    for token in tokens:
+        if lines and _same_line(lines[-1][-1].rect, token.rect):
+            lines[-1].append(token)
+        else:
+            lines.append([token])
+    boxes = [_box(line) for line in lines]
+    heights = [_height(line) for line in lines]
+    paragraph = 0
+    for index, line in enumerate(lines):
+        if index and _starts_paragraph(boxes, heights, index):
+            paragraph += 1
+        for token in line:
+            token.line = (paragraph, index)
+
+
+def _starts_paragraph(boxes: list[Rect], heights: list[float], index: int) -> bool:
+    previous, current = boxes[index - 1], boxes[index]
+    height = max(heights[index - 1], heights[index], 1.0)
+    if current[1] - previous[3] > PARAGRAPH_GAP * height:
+        return True
+    if current[1] < previous[1] - height:  # subiu: outra coluna ou outra região da página
+        return True
+    if current[0] > previous[0] + INDENT * height:
+        return True
+    right = max(box[2] for box in boxes[max(0, index - 4): index + 1])
+    return previous[2] < right - SHORT_LINE * height
 
 
 def _signature(text: str) -> str:

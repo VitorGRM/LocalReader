@@ -34,6 +34,7 @@ from pdf_cleanup import (
     join_hyphenated,
     mark_footnotes,
     mark_margins,
+    rebuild_lines,
     strip_unicode_superscripts,
 )
 from pdf_ocr import OcrCancelled, ocr_pages
@@ -87,6 +88,7 @@ class PdfLayout:
     ocr_pages: list[int] = field(default_factory=list)  # páginas reconhecidas por OCR
     ocr_missing_pages: list[int] = field(default_factory=list)  # precisavam de OCR e ficaram sem
     ocr_error: str = ""
+    scanned_text_pages: int = 0  # páginas digitalizadas que já vieram com texto (OCR anterior)
     _page_index: dict[int, list[tuple[Rect, int]]] = field(default_factory=dict, repr=False)
     _folded: str | None = field(default=None, repr=False)
 
@@ -167,6 +169,9 @@ def fold_text(text: str) -> str:
 class ExtractOptions:
     read_footnotes: bool = False  # ler também o texto das notas de rodapé
     ocr: bool = True  # reconhecer (OCR) as páginas sem texto aproveitável
+    # Refazer o OCR também das páginas digitalizadas que já trazem texto (de um
+    # OCR antigo, como nos livros do Internet Archive), ignorando esse texto.
+    force_ocr: bool = False
     ocr_cache_dir: str | None = None
 
 
@@ -234,34 +239,52 @@ def _native_tokens(page: pymupdf.Page) -> tuple[list[Token], set[str], set]:
         Token(word, (x0, y0, x1, y1), (block_no, line_no))
         for x0, y0, x1, y1, word, block_no, line_no, _ in page.get_text("words", textpage=textpage)
     ]
+    # Tudo daqui em diante nas coordenadas da página como é exibida (com rotação),
+    # onde as linhas de texto são horizontais.
+    matrix = page.rotation_matrix if page.rotation else None
+    if matrix is not None:
+        for token in tokens:
+            token.rect = _transform(token.rect, matrix)
+    rebuild_lines(tokens)
     markers: set[str] = set()
     note_lines: set = set()
     # O "dict" (com tamanho de fonte) é mais lento: só nas páginas com candidatos.
     if any(_MARKER_CANDIDATE_RE.search(token.text) for token in tokens):
         sups = _superscript_spans(page, textpage)
+        if matrix is not None:
+            sups = [(_transform(rect, matrix), text) for rect, text in sups]
         if sups:
             _apply_superscripts(tokens, sups, markers, note_lines)
     strip_unicode_superscripts(tokens, markers, note_lines)
-    if page.rotation:
-        matrix = page.rotation_matrix
-        for token in tokens:
-            r = pymupdf.Rect(token.rect) * matrix
-            token.rect = (r.x0, r.y0, r.x1, r.y1)
     return tokens, markers, note_lines
 
 
-def _needs_ocr(page: pymupdf.Page, tokens: list[Token]) -> bool:
-    """Página digitalizada (imagem sem texto) ou com camada de texto ilegível."""
-    chars = [char for token in tokens for char in token.text if not char.isspace()]
-    if len(chars) >= MIN_TEXT_CHARS:
-        garbage = sum(char == "�" or unicodedata.category(char) in _GARBAGE_CATEGORIES for char in chars)
-        letters = sum(char.isalnum() for char in chars)
-        return garbage > 0.1 * len(chars) or letters < 0.4 * len(chars)
+def _transform(rect: Rect, matrix: pymupdf.Matrix) -> Rect:
+    r = pymupdf.Rect(rect) * matrix
+    return r.x0, r.y0, r.x1, r.y1
+
+
+def _is_scanned(page: pymupdf.Page) -> bool:
+    """Uma imagem cobre boa parte da página (página digitalizada)."""
     page_area = page.rect.get_area()
     if page_area <= 0:
         return False
     covered = sum(pymupdf.Rect(info["bbox"]).get_area() for info in page.get_image_info())
     return covered >= SCANNED_IMAGE_COVERAGE * page_area
+
+
+def _has_text(tokens: list[Token]) -> bool:
+    return sum(len(token.text) for token in tokens) >= MIN_TEXT_CHARS
+
+
+def _needs_ocr(tokens: list[Token], scanned: bool) -> bool:
+    """Página digitalizada sem texto, ou com camada de texto ilegível."""
+    if not _has_text(tokens):
+        return scanned
+    chars = [char for token in tokens for char in token.text if not char.isspace()]
+    garbage = sum(char == "\ufffd" or unicodedata.category(char) in _GARBAGE_CATEGORIES for char in chars)
+    letters = sum(char.isalnum() for char in chars)
+    return garbage > 0.1 * len(chars) or letters < 0.4 * len(chars)
 
 
 def _assemble(pages: list[list[Token]], kinds: set[str]) -> tuple[str, PdfWords]:
@@ -328,6 +351,7 @@ def extract_pdf_layout(
     ocr_done: list[int] = []
     ocr_missing: list[int] = []
     ocr_error = ""
+    scanned_text_pages = 0
 
     with pymupdf.open(path) as doc:
         total = doc.page_count
@@ -337,7 +361,10 @@ def extract_pdf_layout(
             report(page_no, total, f"Lendo o PDF: página {page_no + 1} de {total}...")
             page_sizes.append((page.rect.width, page.rect.height))
             tokens, page_markers, page_notes = _native_tokens(page)
-            if options.ocr and _needs_ocr(page, tokens):
+            scanned = _is_scanned(page)
+            if scanned and _has_text(tokens):
+                scanned_text_pages += 1
+            if options.ocr and (_needs_ocr(tokens, scanned) or (options.force_ocr and scanned)):
                 need_ocr.append(page_no)
             pages.append(tokens)
             markers.append(page_markers)
@@ -373,6 +400,7 @@ def extract_pdf_layout(
     sentence_rects = [_rects_for_range(words, start, end) for _, start, end in sentences]
     layout = PdfLayout(text, sentences, page_sizes, sentence_rects, words)
     layout.ocr_pages, layout.ocr_missing_pages, layout.ocr_error = ocr_done, ocr_missing, ocr_error
+    layout.scanned_text_pages = scanned_text_pages
     return layout
 
 

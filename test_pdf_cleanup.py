@@ -5,8 +5,8 @@ import unittest
 
 import pymupdf
 
-from pdf_cleanup import join_hyphenated
-from pdf_layout import ExtractOptions, extract_pdf_layout
+from pdf_cleanup import Token, join_hyphenated, rebuild_lines
+from pdf_layout import ExtractOptions, _assemble, extract_pdf_layout
 from platform_support import setup_bundled_tools
 
 PAGE_W, PAGE_H = 400, 600
@@ -105,7 +105,7 @@ class HyphenTest(unittest.TestCase):
         self.assertEqual(join_hyphenated("exem-", "plo"), ("exem", "plo"))
         self.assertEqual(join_hyphenated("guarda-", "-chuva"), ("guarda-", "chuva"))
         self.assertEqual(join_hyphenated("fazê-", "lo."), ("fazê-", "lo."))  # pronome
-        self.assertEqual(join_hyphenated("exem­", "plo"), ("exem", "plo"))
+        self.assertEqual(join_hyphenated("exem\u00ad", "plo"), ("exem", "plo"))
         self.assertIsNone(join_hyphenated("Rio-", "Grande"))  # maiúscula: não é sílaba
         self.assertIsNone(join_hyphenated("10-", "20"))
         self.assertIsNone(join_hyphenated("palavra", "seguinte"))
@@ -128,6 +128,57 @@ class SlideTitleTest(unittest.TestCase):
             self.assertEqual(layout.text.count("Resultados"), 3)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+class FragmentedLayerTest(unittest.TestCase):
+    """Camada de texto de OCR antigo: cada palavra (ou pedaço de linha) num bloco
+    próprio, com a linha de base variando um pouco, como nos livros do Internet Archive."""
+
+    LINES = [
+        "The year 1921 not only marked the victorious end of the Civil",
+        "War, it was also the year of economic crisis and of change.",
+        "But the New Economic Policy was actually a backward step.",
+    ]
+
+    def _tokens(self):
+        tokens, block = [], 0
+        for row, line in enumerate(self.LINES):
+            x, top = 40.0, 90.0 + row * 16
+            for i, word in enumerate(line.split()):
+                jitter = (-1.5, 0.0, 1.0)[i % 3]
+                width = len(word) * 5.5
+                tokens.append(Token(word, (x, top + jitter, x + width, top + 12 + jitter), (block, 0)))
+                block += 1  # cada palavra num bloco, como na camada fragmentada
+                x += width + 4
+        return tokens
+
+    def test_rebuilt_lines_keep_sentences_whole(self):
+        tokens = self._tokens()
+        rebuild_lines(tokens)
+        self.assertEqual(len({t.line for t in tokens}), 3)  # três linhas visuais
+        self.assertEqual(len({t.block for t in tokens}), 1)  # um parágrafo só
+        text, _ = _assemble([tokens], {"body"})
+        self.assertEqual(text, "\n".join(self.LINES))
+        sentences = [s for s, _, _ in extract_sentences(text)]
+        self.assertEqual(sentences[0], "\n".join(self.LINES[:2]))  # "Civil / War" não corta a frase
+
+    def test_paragraph_breaks_by_indent_gap_and_short_line(self):
+        def line(y, x0, x1, word, block):
+            return Token(word, (x0, y, x1, y + 12), (block, 0))
+
+        tokens = [
+            line(90, 40, 360, "Uma", 0), line(106, 40, 200, "curta.", 1),  # termina antes da margem
+            line(122, 60, 360, "Recuada", 2), line(138, 40, 360, "segue", 3),  # recuo de parágrafo
+            line(170, 40, 360, "Depois", 4),  # espaço maior entre linhas
+        ]
+        rebuild_lines(tokens)
+        self.assertEqual([t.block for t in tokens], [0, 0, 1, 1, 2])
+
+
+def extract_sentences(text):
+    from sentence_split import split_sentences
+
+    return split_sentences(text)
 
 
 class OcrTest(unittest.TestCase):
@@ -186,6 +237,24 @@ class OcrTest(unittest.TestCase):
             pdf_ocr._Tesseract.run = original
             os.environ["PATH"] = os.path.dirname(tesseract) + os.pathsep + os.environ["PATH"]
         self.assertEqual(again.text, layout.text)
+
+    def test_force_ocr_replaces_old_text_layer(self):
+        """Página digitalizada que já traz texto (de um OCR antigo, aqui com erros)."""
+        path = self._scanned_pdf()
+        doc = pymupdf.open(path)
+        doc[1].insert_text((40, 100), "Tke qu1ck br0wn f0x jumps 0ver the lazy d0g and m0re.", fontsize=14, render_mode=3)
+        doc.saveIncr()
+        doc.close()
+        cache = os.path.join(self.tmp, "cache")
+        original = extract_pdf_layout(path, options=ExtractOptions(ocr_cache_dir=cache))
+        self.assertEqual(original.scanned_text_pages, 1)
+        self.assertEqual(original.ocr_pages, [])
+        self.assertIn("qu1ck", original.text)
+        redone = extract_pdf_layout(path, options=ExtractOptions(ocr_cache_dir=cache, force_ocr=True))
+        self.assertEqual(redone.ocr_pages, [1])
+        self.assertIn("quick brown fox", redone.text)
+        self.assertNotIn("qu1ck", redone.text)
+        self.assertIn("Native text page.", redone.text)  # página sem imagem continua com o texto nativo
 
     def test_without_ocr_the_page_is_reported(self):
         layout = extract_pdf_layout(self._scanned_pdf(), options=ExtractOptions(ocr=False))

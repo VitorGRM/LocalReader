@@ -5,6 +5,7 @@ voz e o pipeline de áudio com seu cache), para que trocar de aba nunca misture
 idioma, texto ou preferências. A janela principal só mostra e controla a aba
 ativa.
 """
+import hashlib
 import os
 import traceback
 from bisect import bisect_left
@@ -32,6 +33,7 @@ from PyQt6.QtWidgets import (
 from document_loader import load_document
 from pdf_annotations import HIGHLIGHT_COLORS, export_with_highlights, load_highlights, save_highlights
 from pdf_layout import ExtractOptions, LoadCancelled, PdfLayout, extract_pdf_layout, sentence_index_at_offset
+from pdf_ocr import OCR_SECONDS_PER_PAGE, default_workers, tesseract_available
 from pdf_view import PdfView, color_icon
 from reading_time import ReadingTimeEstimator
 from sentence_split import split_sentences, word_span
@@ -49,12 +51,21 @@ READY_MESSAGE = "Abra um arquivo ou cole um texto para começar."
 
 PAGE_START, PAGE_LOADING, PAGE_TEXT, PAGE_PDF = range(4)
 READ_FOOTNOTES_KEY = "pdf/read_footnotes"
+FORCE_OCR_GROUP = "pdf_force_ocr"  # PDFs (por caminho) cujo texto é refeito por OCR
 
 
-def pdf_extract_options() -> ExtractOptions:
-    """Opções de extração escolhidas pelo usuário (valem para os PDFs abertos depois)."""
+def _force_ocr_key(path: str) -> str:
+    digest = hashlib.sha1(os.path.normcase(os.path.abspath(path)).encode("utf-8")).hexdigest()
+    return f"{FORCE_OCR_GROUP}/{digest}"
+
+
+def pdf_extract_options(path: str) -> ExtractOptions:
+    """Opções de extração escolhidas pelo usuário para este PDF."""
     settings = QSettings("LocalReader", "TTSReader")
-    return ExtractOptions(read_footnotes=settings.value(READ_FOOTNOTES_KEY, False, type=bool))
+    return ExtractOptions(
+        read_footnotes=settings.value(READ_FOOTNOTES_KEY, False, type=bool),
+        force_ocr=settings.value(_force_ocr_key(path), False, type=bool),
+    )
 
 
 @dataclass
@@ -395,6 +406,7 @@ class ReaderTab(QWidget):
         self.estimator = ReadingTimeEstimator(gap_ms=gap_ms)
         self.status_text = READY_MESSAGE
         self._loader: DocumentLoadThread | None = None
+        self._restore_page: int | None = None  # página para reabrir após recarregar o PDF
         self._disposed = False
         self.setAcceptDrops(True)
         self._build_ui()
@@ -478,11 +490,16 @@ class ReaderTab(QWidget):
             (None, None),
             ("Salvar cópia do PDF com os realces...", self._export_with_highlights),
             ("Remover todos os realces...", self._clear_all_highlights),
+            (None, None),
+            ("Refazer o OCR deste PDF...", self._toggle_force_ocr),
         ):
             if text is None:
                 more_menu.addSeparator()
             else:
-                more_menu.addAction(text).triggered.connect(lambda _checked=False, s=slot: s())
+                action = more_menu.addAction(text)
+                action.triggered.connect(lambda _checked=False, s=slot: s())
+        self._force_ocr_action = action  # o último item: o texto muda conforme o estado
+        more_menu.aboutToShow.connect(self._update_force_ocr_action)
         self.more_btn.setMenu(more_menu)
         for btn in (self.highlight_btn, self.search_btn, self.toc_btn, self.more_btn):
             bar.addWidget(btn)
@@ -686,6 +703,48 @@ class ReaderTab(QWidget):
         if answer == QMessageBox.StandardButton.Yes:
             self.pdf_view.clear_highlights()
 
+    # ---------- OCR refeito ----------
+    def _is_ocr_forced(self) -> bool:
+        return bool(self.path) and QSettings("LocalReader", "TTSReader").value(
+            _force_ocr_key(self.path), False, type=bool
+        )
+
+    def _update_force_ocr_action(self) -> None:
+        if self._is_ocr_forced():
+            self._force_ocr_action.setText("Voltar a usar o texto original do PDF")
+        else:
+            self._force_ocr_action.setText("Refazer o OCR deste PDF (para livros digitalizados com erros)...")
+
+    def _toggle_force_ocr(self) -> None:
+        if self.kind != "pdf" or not self.path:
+            return
+        forced = self._is_ocr_forced()
+        if not forced:
+            if not tesseract_available():
+                QMessageBox.warning(self, "OCR indisponível", "O Tesseract (OCR) não foi encontrado neste computador.")
+                return
+            pages = self.pdf_view.page_count
+            minutes = max(1, round(pages * OCR_SECONDS_PER_PAGE / default_workers() / 60))
+            answer = QMessageBox.question(
+                self,
+                "Refazer o OCR",
+                "O texto das páginas digitalizadas será reconhecido de novo pelo Tesseract, "
+                "ignorando o texto que veio no arquivo. Ajuda em livros digitalizados cujo OCR "
+                "antigo tem erros (palavras trocadas, símbolos no meio do texto).\n\n"
+                f"Neste PDF de {pages} páginas isso leva cerca de {minutes} minuto(s), só na "
+                "primeira vez: depois o resultado fica guardado.\n\nContinuar?",
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        settings = QSettings("LocalReader", "TTSReader")
+        if forced:
+            settings.remove(_force_ocr_key(self.path))
+        else:
+            settings.setValue(_force_ocr_key(self.path), True)
+        # Reabre o mesmo PDF na página em que estava.
+        self._restore_page = self.pdf_view.current_page()
+        self.load_file(self.path)
+
     # ---------- Busca ----------
     def open_find_bar(self) -> None:
         if not self._is_pdf_view():
@@ -795,7 +854,7 @@ class ReaderTab(QWidget):
         self.stack.setCurrentIndex(PAGE_LOADING)
         self.set_status(f"Abrindo {os.path.basename(path)}...")
 
-        loader = DocumentLoadThread(path, pdf_extract_options())
+        loader = DocumentLoadThread(path, pdf_extract_options(path))
         self._loader = loader
         loader.progress.connect(self._on_load_progress)
         loader.loaded.connect(lambda doc, ldr=loader: self._on_loaded(ldr, doc))
@@ -845,7 +904,13 @@ class ReaderTab(QWidget):
         self.text_view.set_content(doc.text, doc.sentences)
         self.close_find_bar()
         self.toc_btn.menu().clear()
+        restore_page, self._restore_page = self._restore_page, None
         if doc.kind == "pdf" and doc.layout is not None:
+            if restore_page is not None:
+                self.current_index = next(
+                    (i for i, rects in enumerate(doc.layout.sentence_rects) if rects and rects[0][0] >= restore_page),
+                    self.current_index,
+                )
             self.pdf_view.set_document(self.path, doc.layout)
             self.pdf_view.set_highlights(load_highlights(self.path, doc.layout))
             self._fill_toc()
