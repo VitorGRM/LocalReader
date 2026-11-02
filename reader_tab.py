@@ -7,14 +7,19 @@ ativa.
 """
 import os
 import traceback
+from bisect import bisect_left
 from dataclasses import dataclass, replace
 
-from PyQt6.QtCore import QPoint, Qt, QThread, QTimer, pyqtSignal
-from PyQt6.QtGui import QFont, QTextCharFormat, QTextCursor
+from PyQt6.QtCore import QEvent, QPoint, Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtGui import QAction, QFont, QIntValidator, QKeySequence, QTextCharFormat, QTextCursor
 from PyQt6.QtWidgets import (
     QButtonGroup,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
+    QMenu,
+    QMessageBox,
     QProgressBar,
     QPushButton,
     QStackedWidget,
@@ -25,8 +30,9 @@ from PyQt6.QtWidgets import (
 )
 
 from document_loader import load_document
+from pdf_annotations import HIGHLIGHT_COLORS, export_with_highlights, load_highlights, save_highlights
 from pdf_layout import LoadCancelled, PdfLayout, extract_pdf_layout, sentence_index_at_offset
-from pdf_view import PdfView
+from pdf_view import PdfView, color_icon
 from reading_time import ReadingTimeEstimator
 from sentence_split import split_sentences, word_span
 from tts_engines import ENGINES
@@ -36,6 +42,8 @@ SUPPORTED_EXTENSIONS = (".pdf", ".docx", ".md", ".txt")
 FILE_DIALOG_FILTER = "Documentos (*.pdf *.docx *.md *.txt);;Todos os arquivos (*)"
 SCROLL_TOP_MARGIN = 24
 CLICK_SLOP_PX = 5
+SEARCH_DELAY_MS = 250  # espera a digitação parar antes de buscar
+MAX_TOC_ENTRIES = 500
 NEW_TAB_TITLE = "Nova aba"
 READY_MESSAGE = "Abra um arquivo ou cole um texto para começar."
 
@@ -404,21 +412,112 @@ class ReaderTab(QWidget):
         self.pdf_mode_btn.setChecked(True)
         self.pdf_mode_btn.clicked.connect(lambda: self._set_view(PAGE_PDF))
         self.text_mode_btn.clicked.connect(lambda: self._set_view(PAGE_TEXT))
+        bar.addSpacing(16)
+
+        # Navegação por página.
+        self.prev_page_btn = QToolButton()
+        self.prev_page_btn.setText("◀")
+        self.prev_page_btn.setToolTip("Página anterior")
+        self.page_edit = QLineEdit()
+        self.page_edit.setFixedWidth(52)
+        self.page_edit.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.page_edit.setValidator(QIntValidator(1, 1, self.page_edit))
+        self.page_edit.setToolTip("Digite a página e tecle Enter (Ctrl+G)")
+        self.page_total_label = QLabel("de 0")
+        self.next_page_btn = QToolButton()
+        self.next_page_btn.setText("▶")
+        self.next_page_btn.setToolTip("Próxima página")
+        self.prev_page_btn.clicked.connect(lambda: self.pdf_view.go_to_page(self.pdf_view.current_page() - 1))
+        self.next_page_btn.clicked.connect(lambda: self.pdf_view.go_to_page(self.pdf_view.current_page() + 1))
+        self.page_edit.returnPressed.connect(self._go_to_typed_page)
+        bar.addWidget(self.prev_page_btn)
+        bar.addWidget(self.page_edit)
+        bar.addWidget(self.page_total_label)
+        bar.addWidget(self.next_page_btn)
+        bar.addSpacing(16)
+
+        # Marca-texto, busca, sumário e mais opções.
+        self.highlight_btn = QToolButton()
+        self.highlight_btn.setText("🖍 Realçar")
+        self.highlight_btn.setToolTip("Realçar o texto selecionado (Ctrl+H)")
+        self.highlight_btn.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
+        self.highlight_btn.setEnabled(False)
+        color_menu = QMenu(self.highlight_btn)
+        for color_id, (label, rgb) in HIGHLIGHT_COLORS.items():
+            action = color_menu.addAction(color_icon(rgb), label)
+            action.triggered.connect(lambda _checked=False, c=color_id: self.pdf_view.highlight_selection(c))
+        self.highlight_btn.setMenu(color_menu)
+        self.highlight_btn.clicked.connect(lambda: self.pdf_view.highlight_selection())
+        self.search_btn = QToolButton()
+        self.search_btn.setText("🔍 Buscar")
+        self.search_btn.setToolTip("Buscar no PDF (Ctrl+F)")
+        self.search_btn.clicked.connect(self.open_find_bar)
+        self.toc_btn = QToolButton()
+        self.toc_btn.setText("📑 Sumário")
+        self.toc_btn.setToolTip("Ir para um capítulo do PDF")
+        self.toc_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.toc_btn.setMenu(QMenu(self.toc_btn))
+        self.more_btn = QToolButton()
+        self.more_btn.setText("⋯")
+        self.more_btn.setToolTip("Mais opções do PDF")
+        self.more_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        more_menu = QMenu(self.more_btn)
+        for text, slot in (
+            ("Ir para a página...  (Ctrl+G)", self._focus_page_edit),
+            (None, None),
+            ("Salvar cópia do PDF com os realces...", self._export_with_highlights),
+            ("Remover todos os realces...", self._clear_all_highlights),
+        ):
+            if text is None:
+                more_menu.addSeparator()
+            else:
+                more_menu.addAction(text).triggered.connect(lambda _checked=False, s=slot: s())
+        self.more_btn.setMenu(more_menu)
+        for btn in (self.highlight_btn, self.search_btn, self.toc_btn, self.more_btn):
+            bar.addWidget(btn)
         bar.addStretch(1)
 
         self.zoom_out_btn = QToolButton()
         self.zoom_out_btn.setText("−")
-        self.zoom_out_btn.setToolTip("Diminuir zoom (Ctrl + roda do mouse)")
+        self.zoom_out_btn.setToolTip("Diminuir zoom (Ctrl + roda do mouse ou Ctrl -)")
         self.fit_btn = QToolButton()
         self.fit_btn.setText("Ajustar à largura")
+        self.fit_btn.setToolTip("Ajustar à largura (Ctrl+0)")
         self.zoom_in_btn = QToolButton()
         self.zoom_in_btn.setText("+")
-        self.zoom_in_btn.setToolTip("Aumentar zoom (Ctrl + roda do mouse)")
+        self.zoom_in_btn.setToolTip("Aumentar zoom (Ctrl + roda do mouse ou Ctrl +)")
         for btn in (self.zoom_out_btn, self.fit_btn, self.zoom_in_btn):
-            btn.setAutoRaise(True)
             bar.addWidget(btn)
+        for btn in self.toolbar.findChildren(QToolButton):
+            btn.setAutoRaise(True)
+        # Só fazem sentido sobre as páginas do PDF (não no modo Texto).
+        self._pdf_tools = [
+            self.prev_page_btn,
+            self.page_edit,
+            self.page_total_label,
+            self.next_page_btn,
+            self.highlight_btn,
+            self.search_btn,
+            self.more_btn,
+            self.zoom_out_btn,
+            self.fit_btn,
+            self.zoom_in_btn,
+        ]
         root.addWidget(self.toolbar)
         self.toolbar.hide()
+
+        root.addWidget(self._build_find_bar())
+
+        for shortcut, slot in (
+            ("Ctrl+F", self.open_find_bar),
+            ("Ctrl+G", self._focus_page_edit),
+            ("Ctrl+H", lambda: self.pdf_view.highlight_selection()),
+        ):
+            action = QAction(self)
+            action.setShortcut(QKeySequence(shortcut))
+            action.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            action.triggered.connect(lambda _checked=False, s=slot: self._is_pdf_view() and s())
+            self.addAction(action)
 
         self.stack = QStackedWidget()
         self.start_page = StartPage()
@@ -434,6 +533,9 @@ class ReaderTab(QWidget):
             view.word_next.connect(self.word_next)
             view.toggle_play.connect(self.toggle_play)
             view.sentence_clicked.connect(self.sentence_clicked)
+        self.pdf_view.page_changed.connect(self._on_page_changed)
+        self.pdf_view.selection_changed.connect(self.highlight_btn.setEnabled)
+        self.pdf_view.highlights_changed.connect(self._save_highlights)
         self.zoom_out_btn.clicked.connect(lambda: self.pdf_view.zoom_by(1 / 1.2))
         self.zoom_in_btn.clicked.connect(lambda: self.pdf_view.zoom_by(1.2))
         self.fit_btn.clicked.connect(self.pdf_view.fit_width)
@@ -441,13 +543,200 @@ class ReaderTab(QWidget):
             self.stack.addWidget(page)
         root.addWidget(self.stack, stretch=1)
 
+    def _build_find_bar(self) -> QWidget:
+        self.find_bar = QWidget()
+        row = QHBoxLayout(self.find_bar)
+        row.setContentsMargins(8, 0, 8, 4)
+        self.find_edit = QLineEdit()
+        self.find_edit.setPlaceholderText("Buscar no PDF (sem diferenciar maiúsculas nem acentos)")
+        self.find_edit.setClearButtonEnabled(True)
+        self.find_edit.setMaximumWidth(380)
+        self.find_edit.installEventFilter(self)
+        self.find_prev_btn = QToolButton()
+        self.find_prev_btn.setText("↑")
+        self.find_prev_btn.setToolTip("Resultado anterior (Shift+Enter)")
+        self.find_next_btn = QToolButton()
+        self.find_next_btn.setText("↓")
+        self.find_next_btn.setToolTip("Próximo resultado (Enter)")
+        self.find_count_label = QLabel()
+        close_btn = QToolButton()
+        close_btn.setText("✕")
+        close_btn.setToolTip("Fechar a busca (Esc)")
+        for btn in (self.find_prev_btn, self.find_next_btn, close_btn):
+            btn.setAutoRaise(True)
+        row.addWidget(self.find_edit)
+        row.addWidget(self.find_prev_btn)
+        row.addWidget(self.find_next_btn)
+        row.addWidget(self.find_count_label)
+        row.addStretch(1)
+        row.addWidget(close_btn)
+
+        self._matches: list[tuple[int, int]] = []
+        self._match_index = -1
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(SEARCH_DELAY_MS)
+        self._search_timer.timeout.connect(self._run_search)
+        self.find_edit.textChanged.connect(lambda _text: self._search_timer.start())
+        self.find_prev_btn.clicked.connect(lambda: self._step_match(-1))
+        self.find_next_btn.clicked.connect(lambda: self._step_match(1))
+        close_btn.clicked.connect(self.close_find_bar)
+        self.find_bar.hide()
+        return self.find_bar
+
+    def _is_pdf_view(self) -> bool:
+        return self.kind == "pdf" and self.stack.currentIndex() == PAGE_PDF
+
     def _set_view(self, page: int) -> None:
         self.stack.setCurrentIndex(page)
         is_pdf_view = page == PAGE_PDF
-        for btn in (self.zoom_out_btn, self.fit_btn, self.zoom_in_btn):
-            btn.setVisible(is_pdf_view)
+        for widget in self._pdf_tools:
+            widget.setVisible(is_pdf_view)
+        self.toc_btn.setVisible(is_pdf_view and not self.toc_btn.menu().isEmpty())
+        if not is_pdf_view:
+            self.close_find_bar()
         self.highlight_current(scroll=True)
         self.focus_reader()
+
+    # ---------- Páginas ----------
+    def _on_page_changed(self, page: int, total: int) -> None:
+        self.page_total_label.setText(f"de {total}")
+        self.page_edit.validator().setTop(max(total, 1))
+        if not self.page_edit.hasFocus():
+            self.page_edit.setText(str(page + 1) if total else "")
+        self.prev_page_btn.setEnabled(page > 0)
+        self.next_page_btn.setEnabled(page < total - 1)
+
+    def _focus_page_edit(self) -> None:
+        self.page_edit.setFocus()
+        self.page_edit.selectAll()
+
+    def _go_to_typed_page(self) -> None:
+        text = self.page_edit.text().strip()
+        if text.isdigit():
+            self.pdf_view.go_to_page(int(text) - 1)
+        else:
+            self.page_edit.setText(str(self.pdf_view.current_page() + 1))
+        self.pdf_view.setFocus()
+
+    def _fill_toc(self) -> None:
+        menu = self.toc_btn.menu()
+        menu.clear()
+        for level, title, page in self.pdf_view.toc()[:MAX_TOC_ENTRIES]:
+            label = "    " * max(level - 1, 0) + (title.strip() or f"Página {page + 1}")
+            action = menu.addAction(label)
+            action.triggered.connect(lambda _checked=False, p=page: self._go_to_page_from_menu(p))
+
+    def _go_to_page_from_menu(self, page: int) -> None:
+        self.pdf_view.go_to_page(page)
+        self.pdf_view.setFocus()
+
+    # ---------- Marca-texto ----------
+    def _save_highlights(self) -> None:
+        if self.kind != "pdf" or not self.path:
+            return
+        try:
+            save_highlights(self.path, self.pdf_view.highlights())
+        except OSError as exc:
+            self.set_status(f"Não foi possível salvar os realces: {exc}")
+
+    def _export_with_highlights(self) -> None:
+        if self.kind != "pdf" or not self.path or self.layout_info is None:
+            return
+        highlights = self.pdf_view.highlights()
+        if not highlights:
+            QMessageBox.information(
+                self, "Sem realces", "Este PDF ainda não tem realces. Selecione um trecho e use 🖍 Realçar."
+            )
+            return
+        base, _ = os.path.splitext(self.path)
+        dest, _ = QFileDialog.getSaveFileName(
+            self, "Salvar cópia com os realces", f"{base} (realces).pdf", "PDF (*.pdf)"
+        )
+        if not dest:
+            return
+        if os.path.normcase(os.path.abspath(dest)) == os.path.normcase(os.path.abspath(self.path)):
+            QMessageBox.warning(
+                self, "Escolha outro nome", "Salve a cópia com outro nome para não sobrescrever o PDF original."
+            )
+            return
+        try:
+            export_with_highlights(self.path, dest, self.layout_info, highlights)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "Erro ao salvar", f"Não foi possível salvar a cópia:\n{exc}")
+            return
+        self.set_status(f"Cópia com realces salva em {dest}")
+
+    def _clear_all_highlights(self) -> None:
+        count = len(self.pdf_view.highlights())
+        if not count:
+            return
+        answer = QMessageBox.question(self, "Remover realces", f"Remover os {count} realce(s) deste PDF?")
+        if answer == QMessageBox.StandardButton.Yes:
+            self.pdf_view.clear_highlights()
+
+    # ---------- Busca ----------
+    def open_find_bar(self) -> None:
+        if not self._is_pdf_view():
+            return
+        self.find_bar.show()
+        self.find_edit.setFocus()
+        self.find_edit.selectAll()
+        if self.find_edit.text().strip():
+            self._run_search()
+
+    def close_find_bar(self) -> None:
+        self._search_timer.stop()
+        was_visible = self.find_bar.isVisible()
+        self.find_bar.hide()
+        self._matches, self._match_index = [], -1
+        self.pdf_view.clear_search()
+        if was_visible:
+            self.focus_reader()
+
+    def _run_search(self) -> None:
+        self._search_timer.stop()
+        query = self.find_edit.text()
+        layout = self.layout_info
+        self._matches = layout.find(query) if layout is not None and self.kind == "pdf" else []
+        self._match_index = -1
+        if self._matches and layout is not None:
+            # Começa no primeiro resultado da página que está na tela, ou depois dela.
+            first_word = bisect_left(layout.words.pages, max(self.pdf_view.current_page(), 0))
+            offset = layout.words.starts[first_word] if first_word < len(layout.words) else 0
+            self._match_index = next((i for i, (start, _) in enumerate(self._matches) if start >= offset), 0)
+        self._show_match()
+
+    def _step_match(self, step: int) -> None:
+        if self._search_timer.isActive():
+            self._run_search()
+            return
+        if not self._matches:
+            return
+        self._match_index = (self._match_index + step) % len(self._matches)
+        self._show_match()
+
+    def _show_match(self) -> None:
+        self.pdf_view.set_search(self._matches, self._match_index)
+        has_query = bool(self.find_edit.text().strip())
+        if self._matches:
+            self.find_count_label.setText(f"{self._match_index + 1} de {len(self._matches)}")
+        else:
+            self.find_count_label.setText("Nenhum resultado" if has_query else "")
+        self.find_prev_btn.setEnabled(len(self._matches) > 1)
+        self.find_next_btn.setEnabled(len(self._matches) > 1)
+
+    def eventFilter(self, obj, event):
+        if obj is self.find_edit and event.type() == QEvent.Type.KeyPress:
+            key = event.key()
+            if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                shift = event.modifiers() & Qt.KeyboardModifier.ShiftModifier
+                self._step_match(-1 if shift else 1)
+                return True
+            if key == Qt.Key.Key_Escape:
+                self.close_find_bar()
+                return True
+        return super().eventFilter(obj, event)
 
     def focus_reader(self) -> None:
         page = self.stack.currentIndex()
@@ -543,8 +832,12 @@ class ReaderTab(QWidget):
         self.current_index = 0 if self.sentences else -1
         self.word_offset = None
         self.text_view.set_content(doc.text, doc.sentences)
+        self.close_find_bar()
+        self.toc_btn.menu().clear()
         if doc.kind == "pdf" and doc.layout is not None:
             self.pdf_view.set_document(self.path, doc.layout)
+            self.pdf_view.set_highlights(load_highlights(self.path, doc.layout))
+            self._fill_toc()
             self.toolbar.show()
             self.pdf_mode_btn.setChecked(True)
             self._set_view(PAGE_PDF)

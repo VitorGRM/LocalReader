@@ -8,9 +8,12 @@ período o mouse está; o retângulo de cada palavra destaca a palavra escolhida
 com as setas. Trabalhar com palavras, e não caractere a caractere, mantém a
 abertura de livros inteiros rápida.
 """
+import re
+import unicodedata
 from array import array
 from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Callable
 
 import pymupdf
@@ -63,6 +66,7 @@ class PdfLayout:
     sentence_rects: list[list[tuple[int, Rect]]]
     words: PdfWords = field(default_factory=PdfWords, repr=False)
     _page_index: dict[int, list[tuple[Rect, int]]] = field(default_factory=dict, repr=False)
+    _folded: str | None = field(default=None, repr=False)
 
     def __post_init__(self):
         for index, rects in enumerate(self.sentence_rects):
@@ -106,6 +110,35 @@ class PdfLayout:
         """Retângulos (um por linha) da palavra ``first`` até a ``last`` (em qualquer ordem)."""
         first, last = min(first, last), max(first, last)
         return _rects_for_range(self.words, self.words.starts[first], self.words.ends[last])
+
+    def range_rects(self, start: int, end: int) -> list[tuple[int, Rect]]:
+        """Retângulos (um por linha) das palavras que tocam text[start:end]."""
+        return _rects_for_range(self.words, start, end)
+
+    def find(self, query: str) -> list[tuple[int, int]]:
+        """(início, fim) de cada ocorrência de ``query`` no texto, sem diferenciar
+        maiúsculas nem acentos; espaços na busca casam com qualquer quebra de linha."""
+        tokens = fold_text(query).split()
+        if not tokens:
+            return []
+        if self._folded is None:
+            self._folded = fold_text(self.text)
+        pattern = re.compile(r"\s+".join(map(re.escape, tokens)))
+        return [match.span() for match in pattern.finditer(self._folded)]
+
+
+@lru_cache(maxsize=4096)
+def _fold_char(char: str) -> str:
+    lower = char.lower()
+    if len(lower) != 1:
+        lower = char
+    base = unicodedata.normalize("NFD", lower)[0]
+    return base if unicodedata.category(base) != "Mn" else lower
+
+
+def fold_text(text: str) -> str:
+    """Minúsculas e sem acentos, com o mesmo tamanho (as posições continuam valendo)."""
+    return "".join(char if char.isascii() and not char.isupper() else _fold_char(char) for char in text)
 
 
 def _page_words(page: pymupdf.Page):

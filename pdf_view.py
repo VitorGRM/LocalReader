@@ -9,7 +9,18 @@ from bisect import bisect_right
 
 import pymupdf
 from PyQt6.QtCore import QPoint, QPointF, QRectF, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QBrush, QColor, QCursor, QImage, QKeySequence, QPainter, QPen, QPixmap, QTransform
+from PyQt6.QtGui import (
+    QBrush,
+    QColor,
+    QCursor,
+    QIcon,
+    QImage,
+    QKeySequence,
+    QPainter,
+    QPen,
+    QPixmap,
+    QTransform,
+)
 from PyQt6.QtWidgets import (
     QApplication,
     QGraphicsPixmapItem,
@@ -19,8 +30,17 @@ from PyQt6.QtWidgets import (
     QMenu,
 )
 
+from pdf_annotations import DEFAULT_COLOR, HIGHLIGHT_COLORS, Highlight, make_highlight
 from pdf_layout import PdfLayout
-from theme import PDF_HIGHLIGHT, PDF_HOVER, PDF_SELECTION, PDF_WORD
+from theme import (
+    PDF_HIGHLIGHT,
+    PDF_HOVER,
+    PDF_SEARCH,
+    PDF_SEARCH_CURRENT,
+    PDF_SELECTION,
+    PDF_USER_HIGHLIGHT_ALPHA,
+    PDF_WORD,
+)
 
 PAGE_GAP = 14.0  # pontos entre páginas
 SCENE_PAD = 14.0
@@ -32,6 +52,17 @@ KEEP_VIEWPORTS = 8  # páginas mais longe que isso liberam a memória
 CLICK_SLOP_PX = 5
 HIGHLIGHT_PAD = 1.2
 AUTOSCROLL_MS = 30  # rolagem ao arrastar a seleção para fora da tela
+MAX_DRAWN_MATCHES = 1000  # acima disso, só o resultado atual da busca é desenhado
+PAGE_PROBE = 0.3  # a "página atual" é a que está a 30% da altura da tela
+
+# Camadas sobre a página (z).
+Z_USER_HIGHLIGHT, Z_HOVER, Z_CURRENT, Z_SEARCH, Z_WORD, Z_SELECTION = 0.5, 1, 2, 2.5, 3, 4
+
+
+def color_icon(rgb: tuple[int, int, int], size: int = 14) -> QIcon:
+    pixmap = QPixmap(size, size)
+    pixmap.fill(QColor(*rgb))
+    return QIcon(pixmap)
 
 
 class _Page:
@@ -59,6 +90,9 @@ class PdfView(QGraphicsView):
     word_prev = pyqtSignal()
     word_next = pyqtSignal()
     toggle_play = pyqtSignal()
+    page_changed = pyqtSignal(int, int)  # página atual (0 = primeira), total
+    selection_changed = pyqtSignal(bool)
+    highlights_changed = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -90,11 +124,18 @@ class PdfView(QGraphicsView):
         self._autoscroll_timer = QTimer(self)
         self._autoscroll_timer.setInterval(AUTOSCROLL_MS)
         self._autoscroll_timer.timeout.connect(self._autoscroll)
+        # Marca-texto do usuário, com os itens desenhados de cada realce.
+        self.highlight_color = DEFAULT_COLOR
+        self._highlights: list[Highlight] = []
+        self._highlight_items: list[list[QGraphicsRectItem]] = []
+        self._match_items: list[QGraphicsRectItem] = []
+        self._last_page = -1
 
         self._render_timer = QTimer(self)
         self._render_timer.setSingleShot(True)
         self._render_timer.timeout.connect(self._render_step)
         self.verticalScrollBar().valueChanged.connect(self._schedule_render)
+        self.verticalScrollBar().valueChanged.connect(self._update_page)
         self.horizontalScrollBar().valueChanged.connect(self._schedule_render)
 
     # ---------- Documento ----------
@@ -116,6 +157,7 @@ class PdfView(QGraphicsView):
         self._zoom = 1.0
         self._apply_scale(keep_center=False)
         self.verticalScrollBar().setValue(self.verticalScrollBar().minimum())
+        self._update_page()
 
     def close_document(self) -> None:
         self._render_timer.stop()
@@ -123,7 +165,13 @@ class PdfView(QGraphicsView):
         self._current_items.clear()
         self._hover_items.clear()
         self._selection_items.clear()
-        self._selection = None
+        self._highlight_items.clear()
+        self._highlights.clear()
+        self._match_items.clear()
+        self._last_page = -1
+        if self._selection is not None:
+            self._selection = None
+            self.selection_changed.emit(False)
         self._drag_anchor = None
         self._dragging = False
         self._scene.clear()
@@ -156,6 +204,7 @@ class PdfView(QGraphicsView):
         if center is not None:
             self.centerOn(center)
         self._schedule_render()
+        self._update_page()
 
     def zoom_by(self, factor: float) -> None:
         new_zoom = max(MIN_ZOOM, min(MAX_ZOOM, self._zoom * factor))
@@ -171,6 +220,47 @@ class PdfView(QGraphicsView):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._apply_scale()
+
+    # ---------- Páginas ----------
+    @property
+    def page_count(self) -> int:
+        return len(self._pages)
+
+    def current_page(self) -> int:
+        if not self._pages:
+            return -1
+        bar = self.verticalScrollBar()
+        if bar.maximum() > 0 and bar.value() >= bar.maximum():
+            return len(self._pages) - 1  # no fim do documento, a última página (mesmo curta)
+        visible = self.mapToScene(self.viewport().rect()).boundingRect()
+        probe = visible.top() + visible.height() * PAGE_PROBE
+        return max(0, min(len(self._pages) - 1, bisect_right(self._page_tops, probe) - 1))
+
+    def _update_page(self, *_args) -> None:
+        page = self.current_page()
+        if page != self._last_page:
+            self._last_page = page
+            self.page_changed.emit(page, len(self._pages))
+
+    def go_to_page(self, page_no: int) -> None:
+        if not self._pages:
+            return
+        page_no = max(0, min(len(self._pages) - 1, page_no))
+        target = self._pages[page_no].top - PAGE_GAP / 2
+        bar = self.verticalScrollBar()
+        bar.setValue(bar.value() + self.mapFromScene(QPointF(0, target)).y())
+        # Páginas finais curtas não chegam ao topo da tela; a pedida é a atual.
+        self._last_page = page_no
+        self.page_changed.emit(page_no, len(self._pages))
+
+    def toc(self) -> list[tuple[int, str, int]]:
+        """Sumário do PDF: (nível, título, página começando em 0)."""
+        if self._doc is None:
+            return []
+        try:
+            return [(level, title, page - 1) for level, title, page, *_ in self._doc.get_toc(simple=True) if page >= 1]
+        except Exception:  # noqa: BLE001 - sumário corrompido não impede a leitura
+            return []
 
     # ---------- Renderização ----------
     def _schedule_render(self, *_args) -> None:
@@ -249,12 +339,12 @@ class PdfView(QGraphicsView):
         """``word``: (início, fim) no texto da palavra escolhida com as setas."""
         self._current = index
         self._remove_items(self._current_items)
-        self._current_items = self._make_items(index, PDF_HIGHLIGHT, 2)
+        self._current_items = self._make_items(index, PDF_HIGHLIGHT, Z_CURRENT)
         word_item = None
         if word is not None and self._layout is not None:
             found = self._layout.word_rect_at(word[0])
             if found is not None:
-                word_item = self._add_rect(*found, PDF_WORD, 3)
+                word_item = self._add_rect(*found, PDF_WORD, Z_WORD)
                 self._current_items.append(word_item)
         if self._hover == index:
             self._set_hover(None)
@@ -271,7 +361,7 @@ class PdfView(QGraphicsView):
         self._hover = index
         self._remove_items(self._hover_items)
         if index is not None:
-            self._hover_items = self._make_items(index, PDF_HOVER, 1)
+            self._hover_items = self._make_items(index, PDF_HOVER, Z_HOVER)
         cursor = Qt.CursorShape.PointingHandCursor if index is not None else Qt.CursorShape.ArrowCursor
         self.viewport().setCursor(cursor)
 
@@ -296,12 +386,16 @@ class PdfView(QGraphicsView):
     def _set_selection(self, selection: tuple[int, int] | None) -> None:
         if selection == self._selection:
             return
+        had_selection = self._selection is not None
         self._selection = selection
         self._remove_items(self._selection_items)
         if selection is not None and self._layout is not None:
             self._selection_items = [
-                self._add_rect(page_no, rect, PDF_SELECTION, 4) for page_no, rect in self._layout.words_rects(*selection)
+                self._add_rect(page_no, rect, PDF_SELECTION, Z_SELECTION)
+                for page_no, rect in self._layout.words_rects(*selection)
             ]
+        if had_selection != (selection is not None):
+            self.selection_changed.emit(selection is not None)
 
     def clear_selection(self) -> None:
         self._set_selection(None)
@@ -343,6 +437,82 @@ class PdfView(QGraphicsView):
         bar = self.verticalScrollBar()
         bar.setValue(bar.value() + delta)
         self._extend_selection(pos)
+
+    # ---------- Marca-texto ----------
+    def highlights(self) -> list[Highlight]:
+        return list(self._highlights)
+
+    def set_highlights(self, highlights: list[Highlight]) -> None:
+        for items in self._highlight_items:
+            self._remove_items(items)
+        self._highlights, self._highlight_items = [], []
+        for highlight in highlights:
+            self._draw_highlight(highlight)
+
+    def _draw_highlight(self, highlight: Highlight) -> None:
+        if self._layout is None:
+            return
+        _, rgb = HIGHLIGHT_COLORS.get(highlight.color, HIGHLIGHT_COLORS[DEFAULT_COLOR])
+        color = QColor(*rgb, PDF_USER_HIGHLIGHT_ALPHA)
+        items = [
+            self._add_rect(page_no, rect, color, Z_USER_HIGHLIGHT)
+            for page_no, rect in self._layout.words_rects(highlight.first, highlight.last)
+        ]
+        self._highlights.append(highlight)
+        self._highlight_items.append(items)
+
+    def highlight_selection(self, color: str | None = None) -> bool:
+        """Realça o texto selecionado (na cor dada, que vira a cor padrão)."""
+        if self._selection is None or self._layout is None:
+            return False
+        if color is not None:
+            self.highlight_color = color
+        self._draw_highlight(make_highlight(self._layout, *self._selection, self.highlight_color))
+        self.clear_selection()
+        self.highlights_changed.emit()
+        return True
+
+    def remove_highlight(self, index: int) -> None:
+        if 0 <= index < len(self._highlights):
+            self._remove_items(self._highlight_items.pop(index))
+            self._highlights.pop(index)
+            self.highlights_changed.emit()
+
+    def clear_highlights(self) -> None:
+        if self._highlights:
+            self.set_highlights([])
+            self.highlights_changed.emit()
+
+    def _highlight_at(self, pos: QPoint) -> int | None:
+        point = self.mapToScene(pos)
+        for index in range(len(self._highlight_items) - 1, -1, -1):
+            if any(item.rect().contains(point) for item in self._highlight_items[index]):
+                return index
+        return None
+
+    # ---------- Busca ----------
+    def set_search(self, matches: list[tuple[int, int]], current: int) -> None:
+        """Desenha os resultados da busca (posições no texto) e mostra o ``current``."""
+        self._remove_items(self._match_items)
+        if self._layout is None:
+            return
+        if len(matches) <= MAX_DRAWN_MATCHES:
+            drawn = range(len(matches))
+        else:
+            drawn = [current] if 0 <= current < len(matches) else []
+        current_rect = None
+        for index in drawn:
+            color = PDF_SEARCH_CURRENT if index == current else PDF_SEARCH
+            for page_no, rect in self._layout.range_rects(*matches[index]):
+                item = self._add_rect(page_no, rect, color, Z_SEARCH)
+                self._match_items.append(item)
+                if index == current and current_rect is None:
+                    current_rect = item.rect()
+        if current_rect is not None:
+            self._ensure_visible(current_rect)
+
+    def clear_search(self) -> None:
+        self._remove_items(self._match_items)
 
     # ---------- Mouse / teclado ----------
     def _page_point(self, pos: QPoint, clamp: bool = False) -> tuple[int, float, float] | None:
@@ -436,6 +606,22 @@ class PdfView(QGraphicsView):
         copy_action.setShortcut(QKeySequence(QKeySequence.StandardKey.Copy))
         copy_action.setEnabled(self.has_selection())
         copy_action.triggered.connect(self.copy_selection)
+        highlight_menu = menu.addMenu("Realçar")
+        highlight_menu.setEnabled(self.has_selection())
+        for color_id, (label, rgb) in HIGHLIGHT_COLORS.items():
+            action = highlight_menu.addAction(color_icon(rgb), label)
+            action.triggered.connect(lambda _checked=False, c=color_id: self.highlight_selection(c))
+
+        hit = self._highlight_at(event.pos())
+        if hit is not None:
+            text = self._highlights[hit].text
+            menu.addSeparator()
+            copy_highlight = menu.addAction("Copiar texto realçado")
+            copy_highlight.triggered.connect(lambda: QApplication.clipboard().setText(text))
+            remove_action = menu.addAction("Remover realce")
+            remove_action.triggered.connect(lambda: self.remove_highlight(hit))
+
+        menu.addSeparator()
         select_all_action = menu.addAction("Selecionar tudo")
         select_all_action.setShortcut(QKeySequence(QKeySequence.StandardKey.SelectAll))
         select_all_action.triggered.connect(self.select_all)
@@ -452,7 +638,18 @@ class PdfView(QGraphicsView):
 
     def keyPressEvent(self, event):
         key = event.key()
-        if event.matches(QKeySequence.StandardKey.Copy):
+        ctrl = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+        if ctrl and key in (Qt.Key.Key_Plus, Qt.Key.Key_Equal):
+            self.zoom_by(1.2)
+        elif ctrl and key == Qt.Key.Key_Minus:
+            self.zoom_by(1 / 1.2)
+        elif ctrl and key == Qt.Key.Key_0:
+            self.fit_width()
+        elif key == Qt.Key.Key_Home:
+            self.go_to_page(0)
+        elif key == Qt.Key.Key_End:
+            self.go_to_page(self.page_count - 1)
+        elif event.matches(QKeySequence.StandardKey.Copy):
             self.copy_selection()
         elif event.matches(QKeySequence.StandardKey.SelectAll):
             self.select_all()

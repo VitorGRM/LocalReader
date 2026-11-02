@@ -45,6 +45,9 @@ PDF_HIGHLIGHT = QColor(255, 196, 0, 95)
 PDF_HOVER = QColor(60, 120, 230, 45)
 PDF_WORD = QColor(255, 130, 0, 110)
 PDF_SELECTION = QColor(0, 110, 230, 75)
+PDF_SEARCH = QColor(255, 150, 0, 60)
+PDF_SEARCH_CURRENT = QColor(255, 80, 0, 120)
+PDF_USER_HIGHLIGHT_ALPHA = 105  # marca-texto do usuário, na cor escolhida
 
 
 def _dark_palette() -> QPalette:

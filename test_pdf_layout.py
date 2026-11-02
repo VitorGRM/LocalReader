@@ -90,6 +90,18 @@ class PdfLayoutTest(unittest.TestCase):
         )
         self.assertTrue(layout.words_text(middle, segunda + 1).endswith("Segunda pagina."))
 
+    def test_find_ignores_case_accents_and_line_breaks(self):
+        _make_pdf(self.path, [[(60, "Coração e PÁGINA aqui."), (80, "Outra pagina segue."), (100, "fim de")], [(60, "linha.")]])
+        layout = extract_pdf_layout(self.path)
+        matches = layout.find("pagina")
+        self.assertEqual([layout.text[s:e] for s, e in matches], ["PÁGINA", "pagina"])
+        self.assertEqual([layout.text[s:e] for s, e in layout.find("coracao")], ["Coração"])
+        # Espaço na busca casa com a quebra de linha e de página do texto.
+        (start, end), = layout.find("de  linha")
+        self.assertEqual({page for page, _ in layout.range_rects(start, end)}, {0, 1})
+        self.assertEqual(layout.find("   "), [])
+        self.assertEqual(layout.find("inexistente"), [])
+
     def test_pdf_without_text(self):
         _make_pdf(self.path, [[]])
         layout = extract_pdf_layout(self.path)
