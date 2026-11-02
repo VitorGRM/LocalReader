@@ -27,7 +27,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit 1 }
           python -m pip install pymupdf
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          python -m unittest test_updater test_reading_time test_sentence_split test_pdf_layout test_pdf_annotations -v
+          python -m unittest test_updater test_reading_time test_sentence_split test_pdf_layout test_pdf_annotations test_pdf_cleanup -v
 
       - name: Compilar instalador
         shell: pwsh

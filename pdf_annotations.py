@@ -9,12 +9,14 @@ cópia do PDF com os realces como anotações de verdade pode ser exportada.
 import hashlib
 import json
 import os
+import re
+from bisect import bisect_left, bisect_right
 from dataclasses import asdict, dataclass
 
 import pymupdf
-from PyQt6.QtCore import QStandardPaths
 
 from pdf_layout import PdfLayout
+from platform_support import app_data_dir
 
 # id -> (rótulo, RGB)
 HIGHLIGHT_COLORS = {
@@ -36,8 +38,7 @@ class Highlight:
 
 
 def default_store_dir() -> str:
-    base = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.GenericDataLocation)
-    return os.path.join(base, "LocalReader", "TTSReader", "highlights")
+    return app_data_dir("highlights")
 
 
 def _store_path(pdf_path: str, store_dir: str | None) -> str:
@@ -63,14 +64,39 @@ def load_highlights(pdf_path: str, layout: PdfLayout, store_dir: str | None = No
             highlight = Highlight(int(item["first"]), int(item["last"]), str(item["color"]), str(item["text"]))
         except (KeyError, TypeError, ValueError):
             continue
+        if highlight.color not in HIGHLIGHT_COLORS:
+            continue
         valid = (
             0 <= highlight.first <= highlight.last < len(layout.words)
-            and highlight.color in HIGHLIGHT_COLORS
             and layout.words_text(highlight.first, highlight.last) == highlight.text
         )
-        if valid:
+        if not valid:
+            # A extração mudou (outra versão do app, notas lidas ou não): procura o
+            # mesmo texto, na ocorrência mais perto de onde estava.
+            highlight = _relocate(layout, highlight)
+        if highlight is not None:
             result.append(highlight)
     return result
+
+
+def _relocate(layout: PdfLayout, highlight: Highlight) -> Highlight | None:
+    tokens = highlight.text.split()
+    if not tokens:
+        return None
+    words = layout.words
+    pattern = re.compile(r"\s+".join(map(re.escape, tokens)))
+    best = None
+    for match in pattern.finditer(layout.text):
+        first = bisect_left(words.starts, match.start())
+        last = bisect_right(words.starts, match.end() - 1) - 1
+        if first >= len(words) or words.starts[first] != match.start() or words.ends[last] != match.end():
+            continue  # pedaço de palavra
+        distance = abs(first - highlight.first)
+        if best is None or distance < best[0]:
+            best = (distance, first, last)
+    if best is None:
+        return None
+    return make_highlight(layout, best[1], best[2], highlight.color)
 
 
 def save_highlights(pdf_path: str, highlights: list[Highlight], store_dir: str | None = None) -> None:

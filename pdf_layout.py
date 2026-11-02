@@ -7,6 +7,11 @@ linha), usados para destacar o período sobre a página e para saber em qual
 período o mouse está; o retângulo de cada palavra destaca a palavra escolhida
 com as setas. Trabalhar com palavras, e não caractere a caractere, mantém a
 abertura de livros inteiros rápida.
+
+Antes de virar texto, as palavras passam pela limpeza de ``pdf_cleanup``
+(cabeçalhos, rodapés, números de página, chamadas e textos de notas, palavras
+hifenizadas); páginas digitalizadas ou com texto ilegível são reconhecidas por
+OCR (``pdf_ocr``), também palavra a palavra.
 """
 import re
 import unicodedata
@@ -18,6 +23,20 @@ from typing import Callable
 
 import pymupdf
 
+from pdf_cleanup import (
+    BODY,
+    FOOTNOTE,
+    MARKER,
+    Token,
+    continues_sentence,
+    group_lines,
+    is_heading_break,
+    join_hyphenated,
+    mark_footnotes,
+    mark_margins,
+    strip_unicode_superscripts,
+)
+from pdf_ocr import OcrCancelled, ocr_pages
 from sentence_split import split_sentences
 
 Rect = tuple[float, float, float, float]  # x0, y0, x1, y1 em pontos da página
@@ -65,6 +84,9 @@ class PdfLayout:
     # Para cada período: lista de (página, retângulo).
     sentence_rects: list[list[tuple[int, Rect]]]
     words: PdfWords = field(default_factory=PdfWords, repr=False)
+    ocr_pages: list[int] = field(default_factory=list)  # páginas reconhecidas por OCR
+    ocr_missing_pages: list[int] = field(default_factory=list)  # precisavam de OCR e ficaram sem
+    ocr_error: str = ""
     _page_index: dict[int, list[tuple[Rect, int]]] = field(default_factory=dict, repr=False)
     _folded: str | None = field(default=None, repr=False)
 
@@ -141,63 +163,217 @@ def fold_text(text: str) -> str:
     return "".join(char if char.isascii() and not char.isupper() else _fold_char(char) for char in text)
 
 
-def _page_words(page: pymupdf.Page):
-    """(bloco, linha, texto, retângulo) de cada palavra, na ordem de leitura do PyMuPDF."""
-    matrix = page.rotation_matrix if page.rotation else None
-    for x0, y0, x1, y1, word, block_no, line_no, _word_no in page.get_text("words", flags=_TEXT_FLAGS):
-        if matrix is not None:
-            r = pymupdf.Rect(x0, y0, x1, y1) * matrix
-            x0, y0, x1, y1 = r.x0, r.y0, r.x1, r.y1
-        yield block_no, line_no, word, (x0, y0, x1, y1)
+@dataclass
+class ExtractOptions:
+    read_footnotes: bool = False  # ler também o texto das notas de rodapé
+    ocr: bool = True  # reconhecer (OCR) as páginas sem texto aproveitável
+    ocr_cache_dir: str | None = None
+
+
+# Chamada de nota em fonte sobrescrita: "texto12", "12Nota" ou "12" sozinho.
+_SUP_TEXT_RE = re.compile(r"^[\d*†‡]{1,3}$")
+_MARKER_CANDIDATE_RE = re.compile(r"(?:[^\W\d_]|[.,;:!?)\]\"'”’])\d{1,3}$|^\d{1,3}(?:[^\W\d_]|$)|[*†‡]")
+_GARBAGE_CATEGORIES = {"Co", "Cc", "Cs"}  # uso privado, controle: fonte sem mapeamento de texto
+MIN_TEXT_CHARS = 40
+SCANNED_IMAGE_COVERAGE = 0.5
+
+
+def _superscript_spans(page: pymupdf.Page, textpage) -> list[tuple[Rect, str]]:
+    """Trechos curtos (números, *, †) em fonte menor e acima da linha de base."""
+    found = []
+    for block in page.get_text("dict", textpage=textpage)["blocks"]:
+        for line in block.get("lines", ()):
+            spans = [span for span in line["spans"] if span["text"].strip()]
+            if not spans:
+                continue
+            main_size = max(span["size"] for span in spans)
+            baseline = max(span["origin"][1] for span in spans if span["size"] >= main_size * 0.95)
+            for span in spans:
+                text = span["text"].strip()
+                if not _SUP_TEXT_RE.match(text):
+                    continue
+                raised = span["origin"][1] < baseline - 0.2 * span["size"]
+                if span["flags"] & 1 or (span["size"] < main_size * 0.85 and raised):
+                    found.append((tuple(span["bbox"]), text))
+    return found
+
+
+def _apply_superscripts(tokens: list[Token], sups, markers: set[str], note_lines: set) -> None:
+    """Tira das palavras as chamadas de nota sobrescritas, ajustando o retângulo."""
+    first_in_line = {id(line_tokens[0]) for line_tokens in group_lines(tokens)}
+    for token in tokens:
+        wx0, wy0, wx1, wy1 = token.rect
+        for (sx0, sy0, sx1, sy1), sup in sups:
+            overlap_x = min(wx1, sx1) - max(wx0, sx0)
+            overlap_y = min(wy1, sy1) - max(wy0, sy0)
+            if overlap_x <= 0 or overlap_y <= 0 or overlap_x * overlap_y < 0.5 * (sx1 - sx0) * (sy1 - sy0):
+                continue
+            first = id(token) in first_in_line
+            text = token.text
+            if text == sup:
+                token.kind = MARKER
+                starts_note = first
+            elif text.endswith(sup) and sx0 > wx0 + 0.5 and not text[-len(sup) - 1].isdigit():
+                token.text, token.rect = text[: -len(sup)], (wx0, wy0, sx0, wy1)
+                starts_note = False
+            elif text.startswith(sup) and sx1 < wx1 - 0.5 and first:
+                token.text, token.rect = text[len(sup):], (sx1, wy0, wx1, wy1)
+                starts_note = True
+            else:
+                continue  # expoente de número (10⁶) ou coincidência: fica como está
+            markers.add(sup)
+            if starts_note:
+                note_lines.add(token.line)
+            break
+
+
+def _native_tokens(page: pymupdf.Page) -> tuple[list[Token], set[str], set]:
+    """Palavras da camada de texto da página, já sem as chamadas de nota."""
+    textpage = page.get_textpage(flags=_TEXT_FLAGS)  # uma análise da página para palavras e fontes
+    tokens = [
+        Token(word, (x0, y0, x1, y1), (block_no, line_no))
+        for x0, y0, x1, y1, word, block_no, line_no, _ in page.get_text("words", textpage=textpage)
+    ]
+    markers: set[str] = set()
+    note_lines: set = set()
+    # O "dict" (com tamanho de fonte) é mais lento: só nas páginas com candidatos.
+    if any(_MARKER_CANDIDATE_RE.search(token.text) for token in tokens):
+        sups = _superscript_spans(page, textpage)
+        if sups:
+            _apply_superscripts(tokens, sups, markers, note_lines)
+    strip_unicode_superscripts(tokens, markers, note_lines)
+    if page.rotation:
+        matrix = page.rotation_matrix
+        for token in tokens:
+            r = pymupdf.Rect(token.rect) * matrix
+            token.rect = (r.x0, r.y0, r.x1, r.y1)
+    return tokens, markers, note_lines
+
+
+def _needs_ocr(page: pymupdf.Page, tokens: list[Token]) -> bool:
+    """Página digitalizada (imagem sem texto) ou com camada de texto ilegível."""
+    chars = [char for token in tokens for char in token.text if not char.isspace()]
+    if len(chars) >= MIN_TEXT_CHARS:
+        garbage = sum(char == "�" or unicodedata.category(char) in _GARBAGE_CATEGORIES for char in chars)
+        letters = sum(char.isalnum() for char in chars)
+        return garbage > 0.1 * len(chars) or letters < 0.4 * len(chars)
+    page_area = page.rect.get_area()
+    if page_area <= 0:
+        return False
+    covered = sum(pymupdf.Rect(info["bbox"]).get_area() for info in page.get_image_info())
+    return covered >= SCANNED_IMAGE_COVERAGE * page_area
+
+
+def _assemble(pages: list[list[Token]], kinds: set[str]) -> tuple[str, PdfWords]:
+    """Monta o texto de leitura: separa linhas, blocos e páginas, junta palavras
+    hifenizadas e não quebra o período que continua no bloco ou página seguinte."""
+    entries: list[list] = []  # [texto, retângulo, página, linha, separador antes]
+    line_count = 0
+    previous_page = previous_line = None
+    for page_no, tokens in enumerate(pages):
+        for token in tokens:
+            if token.kind not in kinds or not token.text:
+                continue
+            text = token.text
+            new_page = bool(entries) and page_no != previous_page
+            if not entries:
+                separator = ""
+            elif new_page:
+                separator = PAGE_SEP
+            elif token.line != previous_line:
+                separator = BLOCK_SEP if token.block != previous_line[0] else LINE_SEP
+            else:
+                separator = WORD_SEP
+            if separator != WORD_SEP:
+                line_count += 1
+            if entries and separator not in (WORD_SEP, ""):
+                last = entries[-1]
+                joined = join_hyphenated(last[0], text)
+                if joined is not None:
+                    last[0], text = joined
+                    separator = ""
+                elif separator != LINE_SEP and continues_sentence(last[0], text, new_page):
+                    separator = LINE_SEP
+                elif separator == LINE_SEP and is_heading_break(last[0], last[1], text, token.rect):
+                    separator = BLOCK_SEP
+            entries.append([text, token.rect, page_no, line_count, separator])
+            previous_page, previous_line = page_no, token.line
+
+    parts: list[str] = []
+    length = 0
+    words = PdfWords()
+    for text, rect, page_no, line, separator in entries:
+        parts.append(separator)
+        length += len(separator)
+        words.append(length, length + len(text), page_no, line, rect)
+        parts.append(text)
+        length += len(text)
+    return "".join(parts), words
 
 
 def extract_pdf_layout(
     path: str,
-    progress: Callable[[int, int], None] | None = None,
+    progress: Callable[[int, int, str], None] | None = None,
     is_cancelled: Callable[[], bool] | None = None,
+    options: ExtractOptions | None = None,
 ) -> PdfLayout:
-    parts: list[str] = []
-    length = 0
-    words = PdfWords()
+    """``progress(atual, total, mensagem)``."""
+    options = options or ExtractOptions()
+    report = progress or (lambda _current, _total, _message: None)
+    pages: list[list[Token]] = []
+    markers: list[set[str]] = []
+    note_lines: list[set] = []
     page_sizes: list[tuple[float, float]] = []
-    line_count = 0
-
-    def add(text: str) -> None:
-        nonlocal length
-        parts.append(text)
-        length += len(text)
+    need_ocr: list[int] = []
+    ocr_done: list[int] = []
+    ocr_missing: list[int] = []
+    ocr_error = ""
 
     with pymupdf.open(path) as doc:
         total = doc.page_count
         for page_no, page in enumerate(doc):
             if is_cancelled is not None and is_cancelled():
                 raise LoadCancelled()
-            if progress is not None:
-                progress(page_no, total)
+            report(page_no, total, f"Lendo o PDF: página {page_no + 1} de {total}...")
             page_sizes.append((page.rect.width, page.rect.height))
-            if page_no > 0:
-                add(PAGE_SEP)
+            tokens, page_markers, page_notes = _native_tokens(page)
+            if options.ocr and _needs_ocr(page, tokens):
+                need_ocr.append(page_no)
+            pages.append(tokens)
+            markers.append(page_markers)
+            note_lines.append(page_notes)
 
-            current = None  # (bloco, linha)
-            for block_no, line_no, word, rect in _page_words(page):
-                if current is None:
-                    line_count += 1
-                elif block_no != current[0]:
-                    add(BLOCK_SEP)
-                    line_count += 1
-                elif line_no != current[1]:
-                    add(LINE_SEP)
-                    line_count += 1
-                else:
-                    add(WORD_SEP)
-                current = (block_no, line_no)
-                words.append(length, length + len(word), page_no, line_count, rect)
-                add(word)
+        if need_ocr:
+            try:
+                results = ocr_pages(
+                    doc,
+                    path,
+                    need_ocr,
+                    progress=lambda done, count: report(
+                        done, count, f"Reconhecendo o texto (OCR): {done} de {count} página(s)..."
+                    ),
+                    is_cancelled=is_cancelled,
+                    cache_dir=options.ocr_cache_dir,
+                )
+            except OcrCancelled:
+                raise LoadCancelled() from None
+            except Exception as exc:  # noqa: BLE001 - sem OCR, o resto do PDF ainda abre
+                ocr_error = str(exc)
+                results = {}
+            for page_no, tokens in results.items():
+                pages[page_no], markers[page_no], note_lines[page_no] = tokens, set(), set()
+            ocr_done = sorted(results)
+        ocr_missing = [page_no for page_no in need_ocr if page_no not in ocr_done]
 
-    text = "".join(parts)
+    mark_margins(pages, page_sizes)
+    for tokens, page_markers, page_notes, (_, height) in zip(pages, markers, note_lines, page_sizes):
+        mark_footnotes(tokens, page_markers, page_notes, height)
+    text, words = _assemble(pages, {BODY, FOOTNOTE} if options.read_footnotes else {BODY})
     sentences = split_sentences(text)
     sentence_rects = [_rects_for_range(words, start, end) for _, start, end in sentences]
-    return PdfLayout(text, sentences, page_sizes, sentence_rects, words)
+    layout = PdfLayout(text, sentences, page_sizes, sentence_rects, words)
+    layout.ocr_pages, layout.ocr_missing_pages, layout.ocr_error = ocr_done, ocr_missing, ocr_error
+    return layout
 
 
 def _rects_for_range(words: PdfWords, start: int, end: int) -> list[tuple[int, Rect]]:

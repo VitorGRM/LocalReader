@@ -53,6 +53,7 @@ from ocr_widget import OCRWidget
 from platform_support import is_frozen, setup_bundled_tools
 from reader_tab import (
     FILE_DIALOG_FILTER,
+    READ_FOOTNOTES_KEY,
     READY_MESSAGE,
     ReaderTab,
     VoiceSettings,
@@ -306,6 +307,14 @@ class MainWindow(QMainWindow):
             theme_group.addAction(action)
             theme_menu.addAction(action)
 
+        view_menu.addSeparator()
+        footnotes_action = QAction("Ler as notas de rodapé dos PDFs", self)
+        footnotes_action.setCheckable(True)
+        footnotes_action.setChecked(self.settings.value(READ_FOOTNOTES_KEY, False, type=bool))
+        footnotes_action.setStatusTip("Vale para os PDFs abertos a partir de agora.")
+        footnotes_action.toggled.connect(self._set_read_footnotes)
+        view_menu.addAction(footnotes_action)
+
         audio_menu = self.menuBar().addMenu("Á&udio")
         keepalive_action = QAction("Manter saída de áudio ativa (evita som e corte entre períodos)", self)
         keepalive_action.setCheckable(True)
@@ -321,6 +330,12 @@ class MainWindow(QMainWindow):
         help_menu.addAction(check_action)
         help_menu.addSeparator()
         help_menu.addAction(about_action)
+
+    def _set_read_footnotes(self, enabled: bool):
+        self.settings.setValue(READ_FOOTNOTES_KEY, enabled)
+        state = "lidas" if enabled else "puladas"
+        if self._active_tab is not None:
+            self._active_tab.set_status(f"Notas de rodapé serão {state} nos PDFs abertos a partir de agora.")
 
     def _set_keep_audio_open(self, enabled: bool):
         self._keep_audio_open = enabled
@@ -674,12 +689,22 @@ class MainWindow(QMainWindow):
             self._stop_playback()
         tab.reset_pipeline()
         tab.ensure_prefetch(PREFETCH_AHEAD)
+        layout = tab.layout_info if tab.kind == "pdf" else None
+        ocr_note = ""
+        if layout is not None and layout.ocr_pages:
+            ocr_note = f" Texto reconhecido por OCR em {len(layout.ocr_pages)} página(s)."
+        if layout is not None and layout.ocr_missing_pages:
+            reason = (
+                f"o OCR falhou ({summarize_error(layout.ocr_error)})" if layout.ocr_error
+                else "o Tesseract (OCR) não está instalado"
+            )
+            ocr_note += f" {len(layout.ocr_missing_pages)} página(s) digitalizada(s) ficaram sem texto: {reason}."
         if tab.sentences:
-            tab.set_status(f"Documento carregado: {len(tab.sentences)} períodos. Pronto para ler.")
+            tab.set_status(f"Documento carregado: {len(tab.sentences)} períodos. Pronto para ler.{ocr_note}")
         elif tab.kind == "pdf":
             tab.set_status(
-                "Este PDF não tem texto selecionável (provavelmente é digitalizado). "
-                "Use a aba OCR para reconhecer o texto e enviá-lo ao leitor."
+                "Não foi possível obter texto deste PDF."
+                + (ocr_note or " Ele parece não ter texto nem páginas digitalizadas reconhecíveis.")
             )
         else:
             tab.set_status("Nenhum período reconhecível foi encontrado no texto.")

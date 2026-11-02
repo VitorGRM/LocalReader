@@ -10,7 +10,7 @@ import traceback
 from bisect import bisect_left
 from dataclasses import dataclass, replace
 
-from PyQt6.QtCore import QEvent, QPoint, Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import QEvent, QPoint, QSettings, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QFont, QIntValidator, QKeySequence, QTextCharFormat, QTextCursor
 from PyQt6.QtWidgets import (
     QButtonGroup,
@@ -31,7 +31,7 @@ from PyQt6.QtWidgets import (
 
 from document_loader import load_document
 from pdf_annotations import HIGHLIGHT_COLORS, export_with_highlights, load_highlights, save_highlights
-from pdf_layout import LoadCancelled, PdfLayout, extract_pdf_layout, sentence_index_at_offset
+from pdf_layout import ExtractOptions, LoadCancelled, PdfLayout, extract_pdf_layout, sentence_index_at_offset
 from pdf_view import PdfView, color_icon
 from reading_time import ReadingTimeEstimator
 from sentence_split import split_sentences, word_span
@@ -48,6 +48,13 @@ NEW_TAB_TITLE = "Nova aba"
 READY_MESSAGE = "Abra um arquivo ou cole um texto para começar."
 
 PAGE_START, PAGE_LOADING, PAGE_TEXT, PAGE_PDF = range(4)
+READ_FOOTNOTES_KEY = "pdf/read_footnotes"
+
+
+def pdf_extract_options() -> ExtractOptions:
+    """Opções de extração escolhidas pelo usuário (valem para os PDFs abertos depois)."""
+    settings = QSettings("LocalReader", "TTSReader")
+    return ExtractOptions(read_footnotes=settings.value(READ_FOOTNOTES_KEY, False, type=bool))
 
 
 @dataclass
@@ -85,11 +92,12 @@ def wait_for_loaders(msecs: int) -> None:
 class DocumentLoadThread(QThread):
     loaded = pyqtSignal(object)
     failed = pyqtSignal(str, str)
-    progress = pyqtSignal(int, int)
+    progress = pyqtSignal(int, int, str)
 
-    def __init__(self, path: str, parent=None):
+    def __init__(self, path: str, options: ExtractOptions | None = None, parent=None):
         super().__init__(parent)
         self.path = path
+        self.options = options
         self._cancelled = False
 
     def cancel(self) -> None:
@@ -99,7 +107,10 @@ class DocumentLoadThread(QThread):
         try:
             if os.path.splitext(self.path)[1].lower() == ".pdf":
                 layout = extract_pdf_layout(
-                    self.path, progress=self.progress.emit, is_cancelled=lambda: self._cancelled
+                    self.path,
+                    progress=self.progress.emit,
+                    is_cancelled=lambda: self._cancelled,
+                    options=self.options,
                 )
                 result = LoadedDocument("pdf", layout.text, layout.sentences, layout)
             else:
@@ -344,10 +355,10 @@ class LoadingPage(QWidget):
         layout.addWidget(self.progress, alignment=Qt.AlignmentFlag.AlignHCenter)
         layout.addStretch(2)
 
-    def set_progress(self, current: int, total: int) -> None:
+    def set_progress(self, current: int, total: int, message: str) -> None:
         self.progress.setRange(0, max(total, 1))
         self.progress.setValue(current)
-        self.label.setText(f"Lendo o PDF: página {current + 1} de {total}...")
+        self.label.setText(message)
 
 
 # ---------------------------------------------------------------------------
@@ -784,7 +795,7 @@ class ReaderTab(QWidget):
         self.stack.setCurrentIndex(PAGE_LOADING)
         self.set_status(f"Abrindo {os.path.basename(path)}...")
 
-        loader = DocumentLoadThread(path)
+        loader = DocumentLoadThread(path, pdf_extract_options())
         self._loader = loader
         loader.progress.connect(self._on_load_progress)
         loader.loaded.connect(lambda doc, ldr=loader: self._on_loaded(ldr, doc))
@@ -804,8 +815,8 @@ class ReaderTab(QWidget):
             self._loader.cancel()
             self._loader = None
 
-    def _on_load_progress(self, current: int, total: int) -> None:
-        self.loading_page.set_progress(current, total)
+    def _on_load_progress(self, current: int, total: int, message: str) -> None:
+        self.loading_page.set_progress(current, total, message)
 
     def _on_loaded(self, loader: DocumentLoadThread, doc: LoadedDocument) -> None:
         if loader is not self._loader or self._disposed:

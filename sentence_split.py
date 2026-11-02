@@ -14,6 +14,9 @@ ABBREVIATIONS = {
 }
 
 _BOUNDARY_RE = re.compile(r"[.!?…]+[\"'”’)\]]*")
+# Linha em branco separa parágrafos: um título sem ponto final não gruda na
+# frase seguinte.
+_PARAGRAPH_RE = re.compile(r"\n[ \t]*\n")
 _LAST_WORD_RE = re.compile(r"(\S+)$")
 # Só a palavra antes do ponto importa; olhar um trecho curto (e não o texto
 # inteiro até ali) evita tempo quadrático em livros longos.
@@ -79,6 +82,9 @@ def split_sentences(text: str) -> list[tuple[str, int, int]]:
         if _is_false_positive(text, match):
             continue
         boundaries.append(match.end())
+    paragraph_breaks = [match.start() for match in _PARAGRAPH_RE.finditer(text)]
+    if paragraph_breaks:
+        boundaries = sorted(set(boundaries).union(paragraph_breaks))
 
     if not boundaries or boundaries[-1] != len(text):
         boundaries.append(len(text))

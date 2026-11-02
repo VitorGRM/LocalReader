@@ -48,10 +48,18 @@ class HighlightStoreTest(unittest.TestCase):
                 Highlight(0, 0, "yellow", "Outro texto"),  # o PDF mudou
                 Highlight(0, 99, "yellow", "x"),  # fora do documento
                 Highlight(1, 1, "roxo", "frase"),  # cor desconhecida
+                Highlight(2, 2, "blue", "fras"),  # pedaço de palavra
             ],
             self.store,
         )
         self.assertEqual(load_highlights(self.path, self.layout, self.store), [Highlight(0, 0, "yellow", "Primeira")])
+
+    def test_relocates_highlight_when_word_numbers_change(self):
+        # "frase" aparece duas vezes (palavras 1 e 4); o índice antigo (5) está mais perto da segunda.
+        save_highlights(self.path, [Highlight(5, 5, "green", "frase.")], self.store)
+        self.assertEqual(load_highlights(self.path, self.layout, self.store), [Highlight(4, 4, "green", "frase.")])
+        save_highlights(self.path, [Highlight(0, 1, "green", "Segunda   frase.")], self.store)  # espaços diferentes
+        self.assertEqual(load_highlights(self.path, self.layout, self.store), [Highlight(3, 4, "green", "Segunda frase.")])
 
     def test_corrupted_file_is_ignored(self):
         save_highlights(self.path, [make_highlight(self.layout, 0, 0, "blue")], self.store)

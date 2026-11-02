@@ -15,6 +15,14 @@ def is_frozen() -> bool:
     return bool(getattr(sys, "frozen", False))
 
 
+def app_data_dir(*parts: str) -> str:
+    """Pasta de dados do app (no Windows, %LOCALAPPDATA%\\LocalReader\\TTSReader\\...)."""
+    from PyQt6.QtCore import QStandardPaths
+
+    base = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.GenericDataLocation)
+    return os.path.join(base, "LocalReader", "TTSReader", *parts)
+
+
 def setup_bundled_tools() -> Path | None:
     """Coloca o Tesseract no PATH e devolve a pasta usada (ou None).
 

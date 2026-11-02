@@ -3,6 +3,7 @@
 Aplicativo desktop com duas áreas integradas:
 
 - **Leitor TTS:** abre PDF, DOCX, Markdown e TXT, divide o texto em períodos e usa vozes Edge, Piper ou gTTS. Cada documento abre numa aba própria, com voz, velocidade e posição de leitura independentes. PDFs são exibidos como PDF, com o período lido destacado sobre a página; passe o mouse sobre um período e clique para pular direto para ele.
+- **Texto limpo para ouvir:** nos PDFs, cabeçalhos, rodapés e números de página não são lidos, palavras partidas no fim da linha são juntadas, chamadas de nota (¹, ²) saem do meio das frases e as notas de rodapé são puladas (dá para ativá-las em Exibir). Um período que continua na página seguinte é lido de uma vez, e títulos não grudam no parágrafo. Páginas digitalizadas ou com texto ilegível são reconhecidas por OCR ao abrir, com o mesmo destaque sobre a página; o resultado fica em cache para as próximas aberturas.
 - **OCR de alta qualidade:** extrai PDFs e imagens com Tesseract, reaproveita automaticamente camadas de texto confiáveis e envia o resultado ao leitor.
 
 ## OCR adaptativo
