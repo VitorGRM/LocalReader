@@ -48,12 +48,10 @@ Além do Tesseract, o Qt 6 precisa da biblioteca `libxcb-cursor0` (Debian/Ubuntu
 
 - **Edge** e **gTTS** precisam de internet; **Piper** e **Proxecto Nós** rodam no computador e baixam cada voz uma vez.
 - **Proxecto Nós (galego):** Celtia, Sabela e Iago, vozes VITS do Proxecto Nós (Universidade de Santiago de Compostela) em ONNX, rodando com o ONNX Runtime (Windows e Linux, sem placa de vídeo). Sabela e Iago usam a transcrição fonética do Cotovía, gerada pelo `pycotovia` (Python puro). Modelos Apache-2.0, vozes CC BY 4.0.
-- **Qwen3-TTS 1.7B (opcional):** voz neural muito natural em 10 idiomas (inclusive português), rodando no computador, com leitura em tom neutro. Em **Áudio → Vozes personalizadas** dá para criar vozes próprias descrevendo-as em texto (por exemplo, "sotaque paulistano, leitura acadêmica neutra") ou clonando 10 a 20 segundos de um áudio; elas aparecem com ★ na lista de vozes. Usa o `faster-qwen3-tts` (CUDA graphs), cerca de 2 vezes mais rápido que a leitura numa RTX 5060. Precisa do PyTorch e, de preferência, de uma placa NVIDIA com ~5 GB de memória de vídeo; o modelo (~4 GB) é baixado no primeiro uso. Não cabe no instalador do Windows, então funciona rodando pelo código-fonte:
-
-```bash
-pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128
-pip install -r requirements-qwen.txt
-```
+- **Qwen3-TTS 1.7B (opcional, placa NVIDIA):** voz neural muito natural em 10 idiomas (inclusive português), rodando no computador e lida em tom neutro. Em **Áudio → Vozes personalizadas** dá para criar vozes próprias descrevendo-as em texto (por exemplo, "sotaque paulistano, leitura acadêmica neutra") ou clonando 10 a 20 segundos de um áudio; elas aparecem com ★ na lista de vozes.
+  - **Instalação:** em **Áudio → Instalar vozes Qwen3-TTS**, o app confere a placa de vídeo e instala um ambiente próprio (Python 3.12, PyTorch com CUDA e `faster-qwen3-tts`) em `%LOCALAPPDATA%\LocalReader\qwen-runtime` (Linux: `~/.local/share/LocalReader/qwen-runtime`), usando o instalador `uv`. São ~3,5 GB de download, mais ~4 GB por modelo no primeiro uso; remover é pelo mesmo menu. Funciona no app instalado e pelo código-fonte.
+  - **Como roda:** a Qwen fica num processo à parte (`qwen_worker.py`), com o Python desse ambiente, então suas bibliotecas nunca conflitam com as do app. Usa CUDA graphs (cerca de 2 vezes mais rápido que a leitura numa RTX 5060).
+  - **Pelo código-fonte, sem o instalador:** `pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128` e `pip install -r requirements-qwen.txt` no próprio venv também funcionam.
 
 ## Versão para Windows (.exe) e atualizações
 

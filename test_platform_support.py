@@ -70,6 +70,17 @@ class LegacyMigrationTest(unittest.TestCase):
         self.assertEqual(platform_support.migrate_legacy_data(), [])
         self.assertEqual(platform_support.app_settings().value("theme"), "light")
 
+    def test_fills_settings_missing_after_a_partial_start(self):
+        """Uma abertura anterior já gravou algo no nome novo: o resto ainda é copiado."""
+        self._old_layout()
+        partial = self.temp_settings("LocalReader")
+        partial.setValue("theme", "light")
+        partial.sync()
+        platform_support.migrate_legacy_data()
+        settings = platform_support.app_settings()
+        self.assertEqual(settings.value("voice/engine"), "piper")  # copiada
+        self.assertEqual(settings.value("theme"), "light")  # a do nome novo prevalece
+
     def test_nothing_to_migrate(self):
         self.assertEqual(platform_support.migrate_legacy_data(), [])
         self.assertFalse(os.path.exists(self.home / ".cache" / "localreader"))

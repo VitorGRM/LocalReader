@@ -22,6 +22,7 @@ APP_NAME = "LocalReader"
 # com esse nome e são trazidos por ``migrate_legacy_data``.
 _LEGACY_APP = "TTSReader"
 _LEGACY_CACHE = "tts-reader"
+_MIGRATED_KEY = "migrated_from_tts_reader"
 
 
 def _settings(application: str):
@@ -55,13 +56,18 @@ def migrate_legacy_data() -> list[str]:
     """Traz configurações, realces, cache do OCR e vozes do nome antigo. Só age na
     primeira abertura depois da troca de nome; devolve o que foi migrado."""
     migrated = []
-    old_settings = _settings(_LEGACY_APP)
     new_settings = app_settings()
-    if old_settings.allKeys() and not new_settings.allKeys():
-        for key in old_settings.allKeys():
+    if not new_settings.value(_MIGRATED_KEY, False, type=bool):
+        # Copia cada configuração que ainda não existe no nome novo (mesmo que
+        # alguma já tenha sido gravada antes, por exemplo numa abertura anterior).
+        old_settings = _settings(_LEGACY_APP)
+        copied = [key for key in old_settings.allKeys() if not new_settings.contains(key)]
+        for key in copied:
             new_settings.setValue(key, old_settings.value(key))
+        new_settings.setValue(_MIGRATED_KEY, True)
         new_settings.sync()
-        migrated.append("configurações")
+        if copied:
+            migrated.append("configurações")
 
     moves = [
         (Path(_generic_data_dir()) / APP_NAME / _LEGACY_APP, Path(app_data_dir())),

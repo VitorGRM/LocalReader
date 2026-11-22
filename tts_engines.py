@@ -317,7 +317,7 @@ class QwenEngine(TTSEngine):
         from qwen_voices import qwen_available
 
         if not qwen_available():
-            raise RuntimeError("pacotes da Qwen3-TTS não instalados (veja requirements-qwen.txt)")
+            raise RuntimeError("ambiente da Qwen3-TTS não instalado (Áudio → Instalar vozes Qwen3-TTS)")
 
     async def list_voices(self) -> list[VoiceInfo]:
         from qwen_voices import CUSTOM_PREFIX, LANGUAGES, SPEAKERS, list_custom_voices
@@ -376,4 +376,18 @@ _register(NosEngine)
 _register(QwenEngine)
 _register(GTTSEngine)
 
-ENGINE_ORDER = [eid for eid in ("edge", "piper", "qwen", "nos", "gtts") if eid in ENGINES]
+_PREFERRED_ORDER = ("edge", "piper", "qwen", "nos", "gtts")
+ENGINE_ORDER = [eid for eid in _PREFERRED_ORDER if eid in ENGINES]
+
+
+def register_qwen() -> bool:
+    """Registra o motor Qwen depois que o ambiente dele é instalado pelo app."""
+    if "qwen" not in ENGINES:
+        _register(QwenEngine)
+    ENGINE_ORDER[:] = [eid for eid in _PREFERRED_ORDER if eid in ENGINES]
+    return "qwen" in ENGINES
+
+
+def unregister_qwen() -> None:
+    ENGINES.pop("qwen", None)
+    ENGINE_ORDER[:] = [eid for eid in _PREFERRED_ORDER if eid in ENGINES]

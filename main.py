@@ -323,13 +323,13 @@ class MainWindow(QMainWindow):
         keepalive_action.toggled.connect(self._set_keep_audio_open)
         audio_menu.addAction(keepalive_action)
         audio_menu.addSeparator()
-        voices_action = QAction("Vozes personalizadas (Qwen3-TTS)...", self)
-        if "qwen" in ENGINES:
-            voices_action.triggered.connect(self._open_voice_studio)
-        else:
-            voices_action.setEnabled(False)
-            voices_action.setToolTip("Precisa da Qwen3-TTS instalada (veja requirements-qwen.txt).")
-        audio_menu.addAction(voices_action)
+        setup_action = QAction("Instalar vozes Qwen3-TTS (placa NVIDIA)...", self)
+        setup_action.triggered.connect(self._open_qwen_setup)
+        audio_menu.addAction(setup_action)
+        self.voices_action = QAction("Vozes personalizadas (Qwen3-TTS)...", self)
+        self.voices_action.triggered.connect(self._open_voice_studio)
+        self.voices_action.setEnabled("qwen" in ENGINES)
+        audio_menu.addAction(self.voices_action)
 
         help_menu = self.menuBar().addMenu("&Ajuda")
         check_action = QAction("Verificar &atualizações...", self)
@@ -345,6 +345,38 @@ class MainWindow(QMainWindow):
         state = "lidas" if enabled else "puladas"
         if self._active_tab is not None:
             self._active_tab.set_status(f"Notas de rodapé serão {state} nos PDFs abertos a partir de agora.")
+
+    def _open_qwen_setup(self):
+        from qwen_setup_dialog import QwenSetupDialog
+
+        dialog = QwenSetupDialog(self)
+        dialog.changed.connect(self._on_qwen_installed_changed)
+        dialog.exec()
+
+    def _on_qwen_installed_changed(self, installed: bool):
+        from qwen_voices import RUNTIME
+        from tts_engines import register_qwen, unregister_qwen
+
+        if installed:
+            available = register_qwen()
+        else:
+            RUNTIME.shutdown()
+            unregister_qwen()
+            available = False
+        self.voices_action.setEnabled(available)
+        self._engine_voices.pop("qwen", None)
+        current = self.engine_combo.currentData()
+        self.engine_combo.blockSignals(True)
+        self.engine_combo.clear()
+        for engine_id in ENGINE_ORDER:
+            engine = ENGINES[engine_id]
+            suffix = "" if engine.requires_internet else " — offline"
+            self.engine_combo.addItem(f"{engine.display_name}{suffix}", userData=engine_id)
+        index = self.engine_combo.findData(current)
+        self.engine_combo.setCurrentIndex(max(index, 0))
+        self.engine_combo.blockSignals(False)
+        if index < 0:
+            self._on_engine_changed()
 
     def _open_voice_studio(self):
         from voice_studio import VoiceStudioDialog
@@ -1208,11 +1240,50 @@ class MainWindow(QMainWindow):
         for thread in list(self._voice_threads):
             if thread.isRunning():
                 thread.wait(2000)
+        from qwen_voices import RUNTIME
+
+        RUNTIME.shutdown()  # encerra o processo da Qwen, se estiver rodando
         super().closeEvent(event)
+
+
+def run_self_test(output_path: str) -> int:
+    """``--self-test arquivo.json``: grava o diagnóstico (versão, motores, Qwen) e sai.
+
+    Serve para conferir o app empacotado sem a interface, inclusive o processo da Qwen.
+    """
+    import json
+
+    from qwen_voices import RUNTIME, runtime_installed, worker_python, worker_script
+    from tts_engines import ENGINE_ORDER
+
+    report = {
+        "version": __version__,
+        "frozen": is_frozen(),
+        "engines": list(ENGINE_ORDER),
+        "qwen_runtime_installed": runtime_installed(),
+        "qwen_python": worker_python(),
+        "qwen_worker_script": str(worker_script()),
+        "qwen_worker_script_exists": worker_script().is_file(),
+    }
+    if report["qwen_python"]:
+        try:
+            report["qwen_ping"] = RUNTIME.submit(RUNTIME.call, "ping").result(timeout=600)
+        except Exception as exc:  # noqa: BLE001
+            report["qwen_ping_error"] = str(exc)
+        finally:
+            RUNTIME.shutdown()
+    with open(output_path, "w", encoding="utf-8") as fh:
+        json.dump(report, fh, ensure_ascii=False, indent=1)
+    return 0
 
 
 def main():
     tools_dir = setup_bundled_tools()
+    if len(sys.argv) >= 3 and sys.argv[1] == "--self-test":
+        from PyQt6.QtCore import QCoreApplication
+
+        QCoreApplication(sys.argv[:1])  # pastas do app (QStandardPaths) precisam de uma aplicação Qt
+        sys.exit(run_self_test(sys.argv[2]))
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setDesktopFileName("localreader")  # liga a janela ao atalho .desktop no Linux

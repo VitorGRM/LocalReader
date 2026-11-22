@@ -8,19 +8,24 @@ primeiro uso), acelerados com CUDA graphs pelo faster-qwen3-tts:
   sotaque paulistano, tom neutro de leitura acadêmica");
 - Base: clona uma voz a partir de alguns segundos de áudio de referência.
 
-Uma placa de 8 GB comporta um modelo por vez: ``QwenRuntime`` mantém só o que
-está em uso e troca quando outro é pedido. Tudo roda numa thread única, a mesma
-em que os CUDA graphs foram capturados.
+Os modelos rodam num processo à parte (``qwen_worker.py``), com o Python do
+ambiente da Qwen: instalado pelo app em ``<dados do app>/qwen-runtime`` (veja
+``qwen_setup``) ou, rodando pelo código-fonte, o próprio. Uma placa de 8 GB
+comporta um modelo por vez: o processo mantém só o que está em uso.
 
 As vozes personalizadas (criadas por descrição ou clonadas de um áudio) ficam em
 ``<dados do app>/voices/<id>/``, com o áudio de referência e o que é dito nele;
 o modelo Base usa os dois para ler qualquer texto com aquela voz.
 """
-import gc
 import importlib.util
 import json
+import os
 import re
 import shutil
+import subprocess
+import sys
+import tempfile
+import threading
 import unicodedata
 import wave
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -29,7 +34,7 @@ from pathlib import Path
 
 import numpy as np
 
-from platform_support import app_data_dir
+from platform_support import SUBPROCESS_KWARGS, app_data_dir
 
 MODEL_IDS = {
     "custom": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
@@ -83,7 +88,7 @@ CUSTOM_PREFIX = "custom:"
 
 
 def qwen_available() -> bool:
-    return all(importlib.util.find_spec(package) for package in ("torch", "faster_qwen3_tts"))
+    return worker_python() is not None
 
 
 def rate_instruction(rate_percent: int) -> str:
@@ -99,68 +104,131 @@ def rate_instruction(rate_percent: int) -> str:
     return ""
 
 
-# ---------- Modelos ----------
+# ---------- Processo da Qwen ----------
+def runtime_dir() -> Path:
+    """Ambiente da Qwen instalado pelo app (Python, PyTorch e faster-qwen3-tts)."""
+    return Path(app_data_dir("qwen-runtime"))
+
+
+def runtime_python() -> Path:
+    env = runtime_dir() / "env"
+    return env / "Scripts" / "python.exe" if os.name == "nt" else env / "bin" / "python"
+
+
+def runtime_installed() -> bool:
+    return runtime_python().is_file() and (runtime_dir() / "ready.json").is_file()
+
+
+def worker_python() -> str | None:
+    """O Python que roda a Qwen: o do ambiente instalado pelo app ou, rodando
+    pelo código-fonte com os pacotes instalados, o próprio."""
+    if runtime_installed():
+        return str(runtime_python())
+    if not getattr(sys, "frozen", False) and all(
+        importlib.util.find_spec(package) for package in ("torch", "faster_qwen3_tts")
+    ):
+        return sys.executable
+    return None
+
+
+def worker_script() -> Path:
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return base / "qwen_worker.py"
+
+
 class QwenRuntime:
-    """Um modelo da Qwen por vez na placa de vídeo, numa thread só."""
+    """Fala com o processo da Qwen (qwen_worker.py), um pedido por vez.
+
+    O processo é iniciado no primeiro pedido e reiniciado se cair; os modelos
+    ficam carregados nele entre um pedido e outro.
+    """
 
     def __init__(self):
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="qwen-tts")
-        self._kind: str | None = None
-        self._model = None
+        self._process: subprocess.Popen | None = None
+        self._next_id = 0
 
     def submit(self, function, *args, **kwargs) -> Future:
         return self._executor.submit(function, *args, **kwargs)
 
-    def model(self, kind: str):
-        """Só na thread da Qwen (via ``submit``)."""
-        if self._kind != kind:
-            import torch
-            from faster_qwen3_tts import FasterQwen3TTS
+    def _ensure_process(self) -> subprocess.Popen:
+        if self._process is not None and self._process.poll() is None:
+            return self._process
+        python = worker_python()
+        if python is None:
+            raise RuntimeError("a Qwen3-TTS não está instalada (Áudio → Instalar vozes Qwen)")
+        env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")
+        env.pop("PYTHONPATH", None)
+        self._process = subprocess.Popen(
+            [python, "-u", str(worker_script())],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace", env=env, **SUBPROCESS_KWARGS,
+        )
+        threading.Thread(target=self._forward_log, args=(self._process,), daemon=True).start()
+        first = self._process.stdout.readline()
+        if not first.strip().startswith("{"):
+            self._process.kill()
+            self._process = None
+            raise RuntimeError("o processo da Qwen3-TTS não iniciou")
+        return self._process
 
-            if not torch.cuda.is_available():
-                raise RuntimeError("a Qwen3-TTS precisa de uma placa de vídeo NVIDIA com CUDA")
-            if self._model is not None:
-                print(f"[Qwen] Liberando o modelo {self._kind} da placa de vídeo...")
-                self._model, self._kind = None, None
-                gc.collect()
-                torch.cuda.empty_cache()
-            print(f"[Qwen] Carregando {MODEL_IDS[kind]} (~4 GB na primeira vez)...")
-            self._model = FasterQwen3TTS.from_pretrained(MODEL_IDS[kind], device="cuda", dtype=torch.bfloat16)
-            self._kind = kind
-            print("[Qwen] Modelo carregado; a primeira frase também prepara a placa de vídeo.")
-        return self._model
+    @staticmethod
+    def _forward_log(process: subprocess.Popen) -> None:
+        for line in process.stderr:
+            line = line.rstrip()
+            if line:
+                print(line)
+
+    def call(self, op: str, **params) -> dict:
+        """Só na thread da Qwen (via ``submit``)."""
+        process = self._ensure_process()
+        self._next_id += 1
+        request = {"id": self._next_id, "op": op, **params}
+        try:
+            process.stdin.write(json.dumps(request) + "\n")
+            process.stdin.flush()
+            line = process.stdout.readline()
+        except OSError as exc:
+            raise RuntimeError(f"o processo da Qwen3-TTS parou ({exc})") from None
+        if not line:
+            self._process = None
+            raise RuntimeError("o processo da Qwen3-TTS parou; veja o registro de logs")
+        response = json.loads(line)
+        if not response.get("ok"):
+            raise RuntimeError(response.get("error") or "falha desconhecida na Qwen3-TTS")
+        return response
+
+    def _generate(self, op: str, **params) -> tuple[np.ndarray, int]:
+        handle, path = tempfile.mkstemp(prefix="localreader_qwen_", suffix=".wav")
+        os.close(handle)
+        try:
+            self.call(op, out=path, **params)
+            return read_audio(path)
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
     # Cada função abaixo roda na thread da Qwen e devolve (amostras float32, taxa).
     def speak(self, text: str, speaker: str, language: str, instruct: str | None):
-        wavs, rate = self.model("custom").generate_custom_voice(
-            text=text, speaker=speaker.lower(), language=language.lower(), instruct=instruct or None
-        )
-        return _mono(wavs[0]), int(rate)
+        return self._generate("speak", text=text, speaker=speaker, language=language, instruct=instruct or "")
 
     def design(self, text: str, description: str, language: str, seed: int | None = None):
-        if seed is not None:
-            import torch
-
-            torch.manual_seed(seed)
-        wavs, rate = self.model("design").generate_voice_design(
-            text=text, instruct=description, language=language.lower()
-        )
-        return _mono(wavs[0]), int(rate)
+        return self._generate("design", text=text, description=description, language=language, seed=seed)
 
     def clone(self, text: str, language: str, reference: str, reference_text: str):
-        wavs, rate = self.model("base").generate_voice_clone(
-            text=text,
-            language=language.lower(),
-            ref_audio=reference,
-            ref_text=reference_text,
-            # Sem a transcrição, só o timbre da referência é usado.
-            xvec_only=not reference_text.strip(),
-        )
-        return _mono(wavs[0]), int(rate)
+        return self._generate("clone", text=text, language=language, reference=reference,
+                              reference_text=reference_text)
 
-
-def _mono(audio) -> np.ndarray:
-    return np.asarray(audio, dtype=np.float32).reshape(-1)
+    def shutdown(self) -> None:
+        process, self._process = self._process, None
+        if process is not None and process.poll() is None:
+            try:
+                process.stdin.close()
+                process.wait(timeout=3)
+            except Exception:  # noqa: BLE001
+                process.kill()
 
 
 RUNTIME = QwenRuntime()
@@ -235,7 +303,7 @@ def save_custom_voice(
         voice_id, counter = f"{base}-{counter}", counter + 1
     voice = CustomVoice(voice_id, name, gender, reference_text.strip(), description.strip(), source)
     voice.folder.mkdir(parents=True)
-    samples = _mono(samples)[: int(sample_rate * MAX_REFERENCE_SECONDS)]
+    samples = np.asarray(samples, dtype=np.float32).reshape(-1)[: int(sample_rate * MAX_REFERENCE_SECONDS)]
     write_wav(str(voice.reference), samples, sample_rate)
     (voice.folder / "voice.json").write_text(json.dumps(asdict(voice), ensure_ascii=False, indent=1), encoding="utf-8")
     return voice

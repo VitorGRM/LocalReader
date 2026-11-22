@@ -27,7 +27,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit 1 }
           python -m pip install pymupdf numpy pycotovia
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          python -m unittest test_updater test_reading_time test_sentence_split test_pdf_layout test_pdf_annotations test_pdf_cleanup test_nos_tts test_platform_support test_qwen_voices -v
+          python -m unittest test_updater test_reading_time test_sentence_split test_pdf_layout test_pdf_annotations test_pdf_cleanup test_nos_tts test_platform_support test_qwen_voices test_qwen_runtime -v
 
       - name: Compilar instalador
         shell: pwsh

@@ -13,6 +13,9 @@ for package in ("piper", "onnxruntime", "edge_tts", "gtts", "docx", "pymupdf", "
     binaries += pkg_binaries
     hiddenimports += pkg_hidden
 
+# O processo da Qwen roda com o Python do ambiente dela, então vai como arquivo.
+datas.append(("qwen_worker.py", "."))
+
 icon = "assets/icon.ico" if os.path.exists("assets/icon.ico") else None
 
 a = Analysis(
