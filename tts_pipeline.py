@@ -30,7 +30,7 @@ class SentencePipeline(QObject):
 
         params_key = f"{engine.id}|{voice_id}|{rate_percent}|{pitch_hz}"
         digest = hashlib.sha1(params_key.encode("utf-8")).hexdigest()[:10]
-        cache_root = os.path.join(tempfile.gettempdir(), "tts_reader_cache")
+        cache_root = os.path.join(tempfile.gettempdir(), "localreader_cache")
         os.makedirs(cache_root, exist_ok=True)
         # Diretório exclusivo por pipeline: ao trocar de documento/voz o pipeline antigo
         # ainda pode ter sínteses em andamento, que não podem colidir com os arquivos

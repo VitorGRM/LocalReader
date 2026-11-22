@@ -4,9 +4,11 @@ A escolha é salva em QSettings. O tema escuro usa o estilo Fusion com uma
 paleta própria; o claro volta ao estilo nativo da plataforma. Cores que não
 vêm da paleta (leitor, destaque, textos secundários) ficam em ``ThemeManager``.
 """
-from PyQt6.QtCore import QObject, QSettings, Qt, pyqtSignal
+from PyQt6.QtCore import QObject, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QPalette
 from PyQt6.QtWidgets import QApplication
+
+from platform_support import app_settings
 
 MODES = ("system", "light", "dark")
 MODE_LABELS = {"system": "Automático (igual ao Windows)", "light": "Claro", "dark": "Escuro"}
@@ -85,7 +87,7 @@ class ThemeManager(QObject):
         super().__init__(app)
         self._app = app
         self._native_style = app.style().objectName()
-        self._settings = QSettings("LocalReader", "TTSReader")
+        self._settings = app_settings()
         mode = str(self._settings.value(SETTINGS_KEY, "system"))
         self.mode = mode if mode in MODES else "system"
         self.is_dark = False

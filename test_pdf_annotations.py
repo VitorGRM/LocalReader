@@ -4,7 +4,16 @@ import unittest
 
 import pymupdf
 
-from pdf_annotations import Highlight, export_with_highlights, load_highlights, make_highlight, save_highlights
+from pdf_annotations import (
+    Highlight,
+    document_key,
+    export_with_highlights,
+    load_highlights,
+    load_text_highlights,
+    make_highlight,
+    make_text_highlight,
+    save_highlights,
+)
 from pdf_layout import extract_pdf_layout
 
 
@@ -67,6 +76,35 @@ class HighlightStoreTest(unittest.TestCase):
         with open(os.path.join(self.store, name), "w", encoding="utf-8") as fh:
             fh.write("{não é json")
         self.assertEqual(load_highlights(self.path, self.layout, self.store), [])
+
+
+class TextHighlightTest(unittest.TestCase):
+    TEXT = "Um texto colado. Outro trecho do texto."
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = os.path.join(self.tmp.name, "store")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_round_trip_and_relocation(self):
+        key = document_key(None, self.TEXT)
+        self.assertTrue(key.startswith("pasted:"))
+        start = self.TEXT.index("Outro")
+        saved = [make_text_highlight(self.TEXT, start + len("Outro trecho"), start, "pink")]
+        self.assertEqual(saved[0].text, "Outro trecho")
+        save_highlights(key, saved, self.store)
+        self.assertEqual(load_text_highlights(key, self.TEXT, self.store), saved)
+        # O arquivo de texto mudou: o realce segue o trecho.
+        changed = "Começo novo. " + self.TEXT
+        moved = load_text_highlights(key, changed, self.store)
+        self.assertEqual([(changed[h.first:h.last], h.color) for h in moved], [("Outro trecho", "pink")])
+        self.assertEqual(load_text_highlights(key, "Nada a ver.", self.store), [])
+
+    def test_files_and_pasted_text_use_different_keys(self):
+        self.assertNotEqual(document_key("a.txt", self.TEXT), document_key(None, self.TEXT))
+        self.assertNotEqual(document_key(None, self.TEXT), document_key(None, self.TEXT + "!"))
 
 
 class ExportTest(unittest.TestCase):

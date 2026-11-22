@@ -1,14 +1,20 @@
 """
 Abstração de motores de TTS: permite trocar entre serviços diferentes
-(edge-tts, gTTS, Piper) para que, se um estiver indisponível ou com
-qualidade ruim, os outros continuem funcionando.
+(edge-tts, gTTS, Piper, Proxecto Nós, Qwen3-TTS) para que, se um estiver
+indisponível ou com qualidade ruim, os outros continuem funcionando.
+
+Motores que dependem de pacotes opcionais (Qwen3-TTS precisa do PyTorch)
+simplesmente não aparecem quando o pacote não está instalado.
 """
 import asyncio
+import importlib.util
 import os
 from dataclasses import dataclass
 from pathlib import Path
 
 import edge_tts
+
+from platform_support import cache_dir
 
 # Em 10/10/2026 a Microsoft passou a recusar (403) o host antigo usado pelo
 # edge-tts <= 7.2.8. O Edge atual usa api.msedgeservices.com, que ainda aceita o
@@ -39,7 +45,7 @@ try:
 except Exception as exc:  # noqa: BLE001 — sem o desvio, o app cai no aviso de troca de motor
     print(f"[tts_engines] Não foi possível ajustar o endpoint do edge-tts: {exc}")
 
-PIPER_VOICE_DIR = Path.home() / ".cache" / "tts-reader" / "piper-voices"
+PIPER_VOICE_DIR = cache_dir("piper-voices")
 
 # Catálogo curado de vozes Piper: a melhor qualidade disponível para cada
 # idioma/local suportado (nomes reais confirmados em
@@ -111,6 +117,7 @@ class VoiceInfo:
     gender: str
     locale: str
     locale_name: str
+    label: str = ""  # nome exibido (vazio = o id)
 
 
 class TTSEngine:
@@ -254,6 +261,104 @@ class PiperEngine(TTSEngine):
         await asyncio.to_thread(_run)
 
 
+class NosEngine(TTSEngine):
+    id = "nos"
+    display_name = "Proxecto Nós (galego)"
+    description = (
+        "Vozes galegas Celtia, Sabela e Iago do Proxecto Nós (Universidade de "
+        "Santiago de Compostela). Rodam 100% no seu computador, sem internet, "
+        "depois de baixar a voz escolhida uma única vez (~130 MB cada). Sem "
+        "controle de tom."
+    )
+    requires_internet = False
+    supports_pitch = False
+    output_extension = ".wav"
+
+    def __init__(self):
+        for package in ("onnxruntime", "numpy"):
+            if importlib.util.find_spec(package) is None:
+                raise RuntimeError(f"pacote '{package}' não instalado")
+        from nos_tts import NosSynthesizer
+
+        self._synth = NosSynthesizer()
+        # Sabela e Iago precisam da transcrição fonética (pycotovia).
+        self._phonemes_available = importlib.util.find_spec("pycotovia") is not None
+
+    async def list_voices(self) -> list[VoiceInfo]:
+        from nos_tts import NOS_VOICES
+
+        return [
+            VoiceInfo(id=voice_id, gender=voice.gender, locale="gl-ES", locale_name="Galician (Spain)", label=voice.name)
+            for voice_id, voice in NOS_VOICES.items()
+            if self._phonemes_available or not voice.phonemes
+        ]
+
+    async def synthesize(self, text, voice_id, rate_percent, pitch_hz, output_path):
+        await asyncio.to_thread(self._synth.synthesize, text, voice_id, rate_percent, output_path)
+
+
+class QwenEngine(TTSEngine):
+    id = "qwen"
+    display_name = "Qwen3-TTS 1.7B (local)"
+    description = (
+        "Modelo neural da Alibaba (Qwen) rodando no seu computador, numa placa de "
+        "vídeo NVIDIA (~5 GB de memória de vídeo). Voz natural em 10 idiomas, "
+        "lida em tom neutro. As vozes com ★ são as suas, criadas em Áudio → Vozes "
+        "personalizadas (por descrição ou a partir de um áudio). Na primeira vez "
+        "baixa o modelo (~4 GB); a cada abertura do app a primeira frase demora "
+        "cerca de 1 minuto para preparar a placa, e depois gera umas 2 vezes mais "
+        "rápido que a leitura. A velocidade é aproximada e não há controle de tom."
+    )
+    requires_internet = False
+    supports_pitch = False
+    output_extension = ".wav"
+
+    def __init__(self):
+        from qwen_voices import qwen_available
+
+        if not qwen_available():
+            raise RuntimeError("pacotes da Qwen3-TTS não instalados (veja requirements-qwen.txt)")
+
+    async def list_voices(self) -> list[VoiceInfo]:
+        from qwen_voices import CUSTOM_PREFIX, LANGUAGES, SPEAKERS, list_custom_voices
+
+        voices = []
+        for language, (locale, locale_name) in LANGUAGES.items():
+            for custom in list_custom_voices():
+                voices.append(VoiceInfo(
+                    id=f"{CUSTOM_PREFIX}{custom.id}|{language}", gender=custom.gender, locale=locale,
+                    locale_name=locale_name, label=f"\u2605 {custom.name}",
+                ))
+            for speaker, gender, description in SPEAKERS:
+                voices.append(VoiceInfo(
+                    id=f"{speaker}|{language}", gender=gender, locale=locale, locale_name=locale_name,
+                    label=f"{speaker.replace('_', ' ')}: voz {description}",
+                ))
+        return voices
+
+    async def synthesize(self, text, voice_id, rate_percent, pitch_hz, output_path):
+        from qwen_voices import CUSTOM_PREFIX, NEUTRAL_INSTRUCTION, RUNTIME, get_custom_voice, rate_instruction
+
+        name, _, language = voice_id.partition("|")
+        language = language or "Portuguese"
+        if name.startswith(CUSTOM_PREFIX):
+            voice = get_custom_voice(name[len(CUSTOM_PREFIX):])
+            if voice is None:
+                raise RuntimeError("esta voz personalizada foi excluída; escolha outra")
+            job = RUNTIME.submit(RUNTIME.clone, text, language, str(voice.reference), voice.reference_text)
+        else:
+            instruct = " ".join(filter(None, (NEUTRAL_INSTRUCTION, rate_instruction(rate_percent))))
+            job = RUNTIME.submit(RUNTIME.speak, text, name, language, instruct)
+        samples, sample_rate = await asyncio.wrap_future(job)
+        await asyncio.to_thread(_write_wav, output_path, samples, sample_rate)
+
+
+def _write_wav(path, samples, sample_rate):
+    from nos_tts import write_wav
+
+    write_wav(path, samples, sample_rate)
+
+
 ENGINES: dict[str, TTSEngine] = {}
 
 
@@ -267,6 +372,8 @@ def _register(engine_cls) -> None:
 
 _register(EdgeEngine)
 _register(PiperEngine)
+_register(NosEngine)
+_register(QwenEngine)
 _register(GTTSEngine)
 
-ENGINE_ORDER = [eid for eid in ("edge", "piper", "gtts") if eid in ENGINES]
+ENGINE_ORDER = [eid for eid in ("edge", "piper", "qwen", "nos", "gtts") if eid in ENGINES]

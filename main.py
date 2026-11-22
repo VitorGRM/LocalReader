@@ -1,5 +1,5 @@
 """
-TTS Reader - leitor com TTS neural e OCR adaptativo de alta qualidade.
+LocalReader - leitor com TTS neural e OCR adaptativo de alta qualidade.
 
 Cada documento abre numa aba própria (como num navegador), com texto, voz,
 velocidade e posição de leitura independentes. O app divide o conteúdo em
@@ -18,7 +18,7 @@ import time
 import traceback
 from datetime import datetime, timedelta
 
-from PyQt6.QtCore import Qt, QObject, QSettings, QThread, QTimer, QUrl, pyqtSignal
+from PyQt6.QtCore import Qt, QObject, QThread, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QAction, QActionGroup, QFont, QKeySequence, QTextCursor
 from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PyQt6.QtWidgets import (
@@ -50,9 +50,10 @@ from PyQt6.QtWidgets import (
 from app_version import GITHUB_REPO, __version__
 from audio_keepalive import AudioKeepAlive
 from ocr_widget import OCRWidget
-from platform_support import is_frozen, setup_bundled_tools
+from platform_support import APP_NAME, app_settings, is_frozen, migrate_legacy_data, setup_bundled_tools
 from reader_tab import (
     FILE_DIALOG_FILTER,
+    SUPPORTED_EXTENSIONS,
     READ_FOOTNOTES_KEY,
     READY_MESSAGE,
     ReaderTab,
@@ -235,11 +236,11 @@ class MainWindow(QMainWindow):
         self.theme = theme
         self.log_dialog: LogViewerDialog | None = None
         self._last_time_update = 0.0
-        self.settings = QSettings("LocalReader", "TTSReader")
+        self.settings = app_settings()
         self._keep_audio_open = self.settings.value(KEEP_AUDIO_KEY, True, type=bool)
         self.audio_keepalive = AudioKeepAlive(self.log_manager.log, self)
 
-        self.setWindowTitle("TTS Reader")
+        self.setWindowTitle("LocalReader")
         self.resize(1280, 800)
 
         # Só a aba ativa toca; trocar de aba pausa a leitura da anterior.
@@ -321,6 +322,14 @@ class MainWindow(QMainWindow):
         keepalive_action.setChecked(self._keep_audio_open)
         keepalive_action.toggled.connect(self._set_keep_audio_open)
         audio_menu.addAction(keepalive_action)
+        audio_menu.addSeparator()
+        voices_action = QAction("Vozes personalizadas (Qwen3-TTS)...", self)
+        if "qwen" in ENGINES:
+            voices_action.triggered.connect(self._open_voice_studio)
+        else:
+            voices_action.setEnabled(False)
+            voices_action.setToolTip("Precisa da Qwen3-TTS instalada (veja requirements-qwen.txt).")
+        audio_menu.addAction(voices_action)
 
         help_menu = self.menuBar().addMenu("&Ajuda")
         check_action = QAction("Verificar &atualizações...", self)
@@ -337,6 +346,19 @@ class MainWindow(QMainWindow):
         if self._active_tab is not None:
             self._active_tab.set_status(f"Notas de rodapé serão {state} nos PDFs abertos a partir de agora.")
 
+    def _open_voice_studio(self):
+        from voice_studio import VoiceStudioDialog
+
+        dialog = VoiceStudioDialog(self)
+        dialog.voices_changed.connect(self._on_custom_voices_changed)
+        dialog.exec()
+
+    def _on_custom_voices_changed(self):
+        # A lista da Qwen inclui as vozes personalizadas: recarrega na próxima vez.
+        self._engine_voices.pop("qwen", None)
+        if self._active_tab is not None and self.engine_combo.currentData() == "qwen":
+            self._fill_voice_combos(self._active_tab)
+
     def _set_keep_audio_open(self, enabled: bool):
         self._keep_audio_open = enabled
         self.settings.setValue(KEEP_AUDIO_KEY, enabled)
@@ -346,8 +368,8 @@ class MainWindow(QMainWindow):
         repo_line = f"\nRepositório: github.com/{GITHUB_REPO}" if GITHUB_REPO else ""
         QMessageBox.about(
             self,
-            "Sobre o TTS Reader",
-            f"TTS Reader + OCR\nVersão {__version__}{repo_line}",
+            "Sobre o LocalReader",
+            f"LocalReader + OCR\nVersão {__version__}{repo_line}",
         )
 
     # ---------- UI ----------
@@ -629,7 +651,7 @@ class MainWindow(QMainWindow):
         self.doc_tabs.setTabText(index, tab.title)
         self.doc_tabs.setTabToolTip(index, tab.path or tab.title)
         if tab is self._active_tab:
-            self.setWindowTitle(f"TTS Reader — {tab.title}")
+            self.setWindowTitle(f"LocalReader — {tab.title}")
 
     def _on_tab_status(self, tab: ReaderTab, text: str):
         if tab is self._active_tab:
@@ -644,7 +666,7 @@ class MainWindow(QMainWindow):
         for btn in (self.prev_btn, self.play_pause_btn, self.next_btn, self.restart_btn):
             btn.setEnabled(has_sentences)
         self.status_label.setText(tab.status_text)
-        self.setWindowTitle(f"TTS Reader — {tab.title}")
+        self.setWindowTitle(f"LocalReader — {tab.title}")
         self._update_progress_label()
         self._update_play_button_label()
 
@@ -820,7 +842,8 @@ class MainWindow(QMainWindow):
         self.voice_combo.blockSignals(True)
         self.voice_combo.clear()
         for v in self.catalog.get(lang, {}).get(country, []):
-            label = f"{v.id} ({v.gender})" if v.gender != "N/A" else v.id
+            name = v.label or v.id
+            label = f"{name} ({v.gender})" if v.gender != "N/A" else name
             self.voice_combo.addItem(label, userData=v.id)
         index = self.voice_combo.findData(tab.settings.voice_id)
         if self.voice_combo.count():
@@ -1191,12 +1214,21 @@ class MainWindow(QMainWindow):
 def main():
     tools_dir = setup_bundled_tools()
     app = QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+    app.setDesktopFileName("localreader")  # liga a janela ao atalho .desktop no Linux
+    migrated = migrate_legacy_data()
     theme = ThemeManager(app)
     log_manager = LogManager()
     install_excepthook(log_manager)
-    log_manager.log(f"TTS Reader {__version__} — Tesseract: {tools_dir or 'usando o PATH do sistema'}")
+    log_manager.log(f"{APP_NAME} {__version__} — Tesseract: {tools_dir or 'usando o PATH do sistema'}")
+    if migrated:
+        log_manager.log(f"Dados do nome antigo (TTS Reader) trazidos para {APP_NAME}: {len(migrated)} item(ns).")
     window = MainWindow(log_manager, theme)
     window.showMaximized()
+    # Arquivos passados na linha de comando ("Abrir com" do gerenciador de arquivos).
+    for path in app.arguments()[1:]:
+        if os.path.isfile(path) and os.path.splitext(path)[1].lower() in SUPPORTED_EXTENSIONS:
+            window._open_path(os.path.abspath(path), window._active_tab)
     sys.exit(app.exec())
 
 

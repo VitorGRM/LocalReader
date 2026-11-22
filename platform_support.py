@@ -17,12 +17,73 @@ def is_frozen() -> bool:
     return bool(getattr(sys, "frozen", False))
 
 
-def app_data_dir(*parts: str) -> str:
-    """Pasta de dados do app (no Windows, %LOCALAPPDATA%\\LocalReader\\TTSReader\\...)."""
+APP_NAME = "LocalReader"
+# Até a v1.5.x o programa se chamava "TTS Reader": configurações e dados ficavam
+# com esse nome e são trazidos por ``migrate_legacy_data``.
+_LEGACY_APP = "TTSReader"
+_LEGACY_CACHE = "tts-reader"
+
+
+def _settings(application: str):
+    from PyQt6.QtCore import QSettings
+
+    return QSettings(APP_NAME, application)
+
+
+def app_settings():
+    """Configurações do app (QSettings)."""
+    return _settings(APP_NAME)
+
+
+def _generic_data_dir() -> str:
     from PyQt6.QtCore import QStandardPaths
 
-    base = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.GenericDataLocation)
-    return os.path.join(base, "LocalReader", "TTSReader", *parts)
+    return QStandardPaths.writableLocation(QStandardPaths.StandardLocation.GenericDataLocation)
+
+
+def app_data_dir(*parts: str) -> str:
+    """Pasta de dados do app (Windows: %LOCALAPPDATA%\\LocalReader; Linux: ~/.local/share/LocalReader)."""
+    return os.path.join(_generic_data_dir(), APP_NAME, *parts)
+
+
+def cache_dir(*parts: str) -> Path:
+    """Pasta das vozes baixadas (~/.cache/localreader)."""
+    return Path.home() / ".cache" / APP_NAME.lower() / Path(*parts)
+
+
+def migrate_legacy_data() -> list[str]:
+    """Traz configurações, realces, cache do OCR e vozes do nome antigo. Só age na
+    primeira abertura depois da troca de nome; devolve o que foi migrado."""
+    migrated = []
+    old_settings = _settings(_LEGACY_APP)
+    new_settings = app_settings()
+    if old_settings.allKeys() and not new_settings.allKeys():
+        for key in old_settings.allKeys():
+            new_settings.setValue(key, old_settings.value(key))
+        new_settings.sync()
+        migrated.append("configurações")
+
+    moves = [
+        (Path(_generic_data_dir()) / APP_NAME / _LEGACY_APP, Path(app_data_dir())),
+        (Path.home() / ".cache" / _LEGACY_CACHE, cache_dir()),
+    ]
+    for old_dir, new_dir in moves:
+        if not old_dir.is_dir():
+            continue
+        new_dir.mkdir(parents=True, exist_ok=True)
+        for child in list(old_dir.iterdir()):
+            target = new_dir / child.name
+            if not target.exists():
+                try:
+                    os.replace(child, target)
+                    migrated.append(str(target))
+                except OSError:
+                    pass  # fica no lugar antigo; o app recria o que precisar
+        try:
+            old_dir.rmdir()
+        except OSError:
+            pass
+    return migrated
 
 
 def setup_bundled_tools() -> Path | None:

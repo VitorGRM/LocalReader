@@ -472,6 +472,14 @@ class PdfView(QGraphicsView):
         self.highlights_changed.emit()
         return True
 
+    def add_highlight(self, first: int, last: int, color: str) -> None:
+        """Realça as palavras ``first``..``last`` (usado pelo modo Texto do mesmo PDF)."""
+        if self._layout is None:
+            return
+        self.highlight_color = color
+        self._draw_highlight(make_highlight(self._layout, first, last, color))
+        self.highlights_changed.emit()
+
     def remove_highlight(self, index: int) -> None:
         if 0 <= index < len(self._highlights):
             self._remove_items(self._highlight_items.pop(index))

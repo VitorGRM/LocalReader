@@ -131,7 +131,7 @@ class UpdateManager(QObject):
             text += f"\n\nNovidades:\n{notes}"
 
         if is_frozen() and info.installable:
-            text += "\n\nBaixar e instalar agora? O TTS Reader será fechado e reaberto automaticamente."
+            text += "\n\nBaixar e instalar agora? O LocalReader será fechado e reaberto automaticamente."
             answer = QMessageBox.question(self.window, "Atualização disponível", text)
             if answer == QMessageBox.StandardButton.Yes:
                 self._start_download(info)
@@ -144,7 +144,7 @@ class UpdateManager(QObject):
     # ---------- download e instalação ----------
     def _start_download(self, info: updater.UpdateInfo):
         dialog = QProgressDialog("Baixando atualização...", "Cancelar", 0, 100, self.window)
-        dialog.setWindowTitle("Atualizando o TTS Reader")
+        dialog.setWindowTitle("Atualizando o LocalReader")
         dialog.setWindowModality(Qt.WindowModality.WindowModal)
         dialog.setMinimumDuration(0)
         dialog.setAutoClose(False)

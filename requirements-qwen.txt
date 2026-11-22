@@ -1,0 +1,16 @@
+# Opcional: voz Qwen3-TTS 1.7B rodando no computador (Windows ou Linux).
+# Precisa de uma placa de vídeo NVIDIA com ~5 GB livres de memória de vídeo.
+#
+# 1) PyTorch com CUDA (para placas RTX 50xx use cu128 ou mais novo):
+#      pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128
+# 2) Este arquivo:
+#      pip install -r requirements-qwen.txt
+#
+# Usa o faster-qwen3-tts (CUDA graphs), ~15-20x mais rápido que o pacote
+# oficial qwen-tts, que não deve ser instalado junto (os dois instalam o
+# módulo qwen_tts). O modelo (~4 GB) é baixado do Hugging Face no primeiro
+# uso. O PyTorch não cabe no instalador do Windows, então a Qwen só aparece
+# rodando pelo código-fonte.
+faster-qwen3-tts>=0.5.4,<0.6
+# Versões mais novas do Transformers quebram o qwen-tts-hf (0.1.1.post1).
+transformers==5.15.1

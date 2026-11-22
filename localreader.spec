@@ -1,5 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
-# Gera dist/TTSReader/TTSReader.exe (modo pasta: abre bem mais rápido que --onefile).
+# Gera dist/LocalReader/LocalReader.exe (modo pasta: abre bem mais rápido que --onefile).
 import os
 
 from PyInstaller.utils.hooks import collect_all
@@ -7,7 +7,7 @@ from PyInstaller.utils.hooks import collect_all
 datas, binaries, hiddenimports = [], [], []
 # Pacotes com dados/binários nativos que a análise estática não encontra sozinha
 # (espeak-ng-data do Piper, onnxruntime, certificados para o edge-tts, etc.).
-for package in ("piper", "onnxruntime", "edge_tts", "gtts", "docx", "pymupdf", "certifi"):
+for package in ("piper", "onnxruntime", "edge_tts", "gtts", "docx", "pymupdf", "certifi", "pycotovia"):
     pkg_datas, pkg_binaries, pkg_hidden = collect_all(package)
     datas += pkg_datas
     binaries += pkg_binaries
@@ -21,7 +21,8 @@ a = Analysis(
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
-    excludes=["tkinter"],
+    # A Qwen3-TTS (PyTorch, vários GB) não cabe no instalador: só roda pelo código-fonte.
+    excludes=["tkinter", "torch", "torchaudio", "qwen_tts", "faster_qwen3_tts", "transformers"],
 )
 pyz = PYZ(a.pure)
 
@@ -30,7 +31,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name="TTSReader",
+    name="LocalReader",
     console=False,
     upx=False,
     icon=icon,
@@ -41,5 +42,5 @@ coll = COLLECT(
     a.binaries,
     a.datas,
     upx=False,
-    name="TTSReader",
+    name="LocalReader",
 )

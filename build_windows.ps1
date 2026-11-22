@@ -1,19 +1,20 @@
 <#
 .SYNOPSIS
-  Gera o instalador do Windows: release\TTSReader-Setup.exe (+ .sha256).
+  Gera o instalador do Windows: release\LocalReader-Setup.exe (+ .sha256), e uma
+  cópia com o nome antigo (TTSReader-Setup.exe) para as versões antigas se atualizarem.
 
 .DESCRIPTION
   1. grava _build_info.py (versão e repositório do GitHub)
-  2. PyInstaller -> dist\TTSReader\TTSReader.exe
-  3. embute o Tesseract (com idiomas) em dist\TTSReader\tesseract
-  4. Inno Setup -> release\TTSReader-Setup.exe
+  2. PyInstaller -> dist\LocalReader\LocalReader.exe
+  3. embute o Tesseract (com idiomas) em dist\LocalReader\tesseract
+  4. Inno Setup -> release\LocalReader-Setup.exe
   5. calcula o SHA-256 usado pelo atualizador
 
   Requisitos locais: Python 3.11+ no PATH. Tesseract e Inno Setup são
   instalados via Chocolatey se não existirem (o runner do GitHub já tem o choco).
 
 .EXAMPLE
-  .\build_windows.ps1 -Version v1.0.0 -Repo meuusuario/tts-reader
+  .\build_windows.ps1 -Version v1.0.0 -Repo meuusuario/LocalReader
 #>
 param(
     [string]$Version = "",
@@ -28,7 +29,9 @@ Set-Location $PSScriptRoot
 
 $TesseractDir = Join-Path $env:ProgramFiles "Tesseract-OCR"
 $TesseractLangs = @("por", "spa", "fra", "deu", "ita")  # eng e osd já vêm no Tesseract
-$InstallerName = "TTSReader-Setup.exe"
+$InstallerName = "LocalReader-Setup.exe"
+# Versões até a v1.5.x (TTS Reader) procuram este nome na release ao se atualizar.
+$LegacyInstallerName = "TTSReader-Setup.exe"
 
 function Assert-Ok($step) {
     if ($LASTEXITCODE -ne 0) { throw "Falha em: $step (código $LASTEXITCODE)" }
@@ -48,7 +51,7 @@ if (-not (Test-Path ".venv-build\Scripts\python.exe")) {
 $py = Join-Path $PSScriptRoot ".venv-build\Scripts\python.exe"
 & $py -m pip install --upgrade pip; Assert-Ok "atualizar pip"
 & $py -m pip install -r requirements.txt pyinstaller; Assert-Ok "instalar dependências"
-& $py -m PyInstaller tts_reader.spec --noconfirm --clean; Assert-Ok "PyInstaller"
+& $py -m PyInstaller localreader.spec --noconfirm --clean; Assert-Ok "PyInstaller"
 
 # --- 3. Tesseract embutido ---------------------------------------------------
 if (-not $SkipTesseract) {
@@ -60,7 +63,7 @@ if (-not $SkipTesseract) {
     }
     if (-not (Test-Path "$TesseractDir\tesseract.exe")) { throw "Tesseract não foi encontrado em '$TesseractDir' após a instalação." }
 
-    $target = "dist\TTSReader\tesseract"
+    $target = "dist\LocalReader\tesseract"
     Copy-Item $TesseractDir $target -Recurse -Force -ErrorAction Stop
     Remove-Item "$target\unins*" -Force -ErrorAction SilentlyContinue
     foreach ($lang in $TesseractLangs) {
@@ -92,13 +95,16 @@ if (-not $iscc) {
     $iscc = Find-Iscc
     if (-not $iscc) { throw "Inno Setup não foi encontrado após a instalação." }
 }
-& $iscc "/DAppVersion=$semver" "installer\tts-reader.iss"; Assert-Ok "Inno Setup"
+& $iscc "/DAppVersion=$semver" "installer\localreader.iss"; Assert-Ok "Inno Setup"
 
 # --- 5. checksum -------------------------------------------------------------
 $installer = Join-Path "release" $InstallerName
 if (-not (Test-Path $installer)) { throw "O instalador '$installer' não foi gerado." }
 $hash = (Get-FileHash $installer -Algorithm SHA256 -ErrorAction Stop).Hash.ToLower()
 [IO.File]::WriteAllText((Join-Path $PSScriptRoot "$installer.sha256"), "$hash  $InstallerName`n", (New-Object Text.UTF8Encoding $false))
+$legacy = Join-Path "release" $LegacyInstallerName
+Copy-Item $installer $legacy -Force -ErrorAction Stop
+[IO.File]::WriteAllText((Join-Path $PSScriptRoot "$legacy.sha256"), "$hash  $LegacyInstallerName`n", (New-Object Text.UTF8Encoding $false))
 
 Write-Host ""
 Write-Host "Pronto: $installer"

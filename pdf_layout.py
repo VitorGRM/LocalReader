@@ -142,13 +142,18 @@ class PdfLayout:
     def find(self, query: str) -> list[tuple[int, int]]:
         """(início, fim) de cada ocorrência de ``query`` no texto, sem diferenciar
         maiúsculas nem acentos; espaços na busca casam com qualquer quebra de linha."""
-        tokens = fold_text(query).split()
-        if not tokens:
-            return []
         if self._folded is None:
             self._folded = fold_text(self.text)
-        pattern = re.compile(r"\s+".join(map(re.escape, tokens)))
-        return [match.span() for match in pattern.finditer(self._folded)]
+        return find_in_folded(self._folded, query)
+
+
+def find_in_folded(folded: str, query: str) -> list[tuple[int, int]]:
+    """Ocorrências de ``query`` em ``folded`` (um texto passado por ``fold_text``)."""
+    tokens = fold_text(query).split()
+    if not tokens:
+        return []
+    pattern = re.compile(r"\s+".join(map(re.escape, tokens)))
+    return [match.span() for match in pattern.finditer(folded)]
 
 
 @lru_cache(maxsize=4096)

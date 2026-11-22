@@ -1,8 +1,11 @@
 """Atualizações via GitHub Releases, sem dependências além da biblioteca padrão.
 
 Fluxo: consulta ``releases/latest`` do repositório, compara com a versão atual,
-baixa ``TTSReader-Setup.exe`` conferindo o SHA-256 publicado em
-``TTSReader-Setup.exe.sha256`` e executa o instalador em modo silencioso.
+baixa ``LocalReader-Setup.exe`` conferindo o SHA-256 publicado em
+``LocalReader-Setup.exe.sha256`` e executa o instalador em modo silencioso.
+Releases antigas (de quando o programa se chamava TTS Reader) só têm
+``TTSReader-Setup.exe``; as novas publicam os dois nomes, para que versões
+antigas instaladas continuem se atualizando.
 Este módulo não depende de Qt; a interface fica em ``update_ui.py``.
 """
 from __future__ import annotations
@@ -21,12 +24,13 @@ from typing import Callable
 
 import app_version
 
-INSTALLER_NAME = "TTSReader-Setup.exe"
+INSTALLER_NAME = "LocalReader-Setup.exe"
 CHECKSUM_NAME = INSTALLER_NAME + ".sha256"
+LEGACY_INSTALLER_NAME = "TTSReader-Setup.exe"
 API_TIMEOUT = 10
 DOWNLOAD_TIMEOUT = 30
 CHUNK_SIZE = 64 * 1024
-USER_AGENT = "TTSReader-Updater"
+USER_AGENT = "LocalReader-Updater"
 
 
 class UpdateError(Exception):
@@ -115,12 +119,16 @@ def check_for_update(repo: str, current: str) -> UpdateInfo | None:
         raise UpdateError(f"A última release tem uma tag fora do padrão: {tag!r}.") from exc
     if not newer:
         return None
+    installer_url, checksum_url = _asset_url(release, INSTALLER_NAME), _asset_url(release, CHECKSUM_NAME)
+    if not installer_url:
+        installer_url = _asset_url(release, LEGACY_INSTALLER_NAME)
+        checksum_url = _asset_url(release, LEGACY_INSTALLER_NAME + ".sha256")
     return UpdateInfo(
         version=tag.lstrip("vV"),
         notes=(release.get("body") or "").strip(),
         page_url=release.get("html_url", f"https://github.com/{repo}/releases"),
-        installer_url=_asset_url(release, INSTALLER_NAME),
-        checksum_url=_asset_url(release, CHECKSUM_NAME),
+        installer_url=installer_url,
+        checksum_url=checksum_url,
     )
 
 
@@ -143,7 +151,7 @@ def download_installer(
     if not re.fullmatch(r"[0-9a-f]{64}", expected):
         raise UpdateError("Arquivo de checksum inválido.")
 
-    directory = tempfile.mkdtemp(prefix="tts_reader_update_")
+    directory = tempfile.mkdtemp(prefix="localreader_update_")
     destination = os.path.join(directory, INSTALLER_NAME)
     digest = hashlib.sha256()
     try:

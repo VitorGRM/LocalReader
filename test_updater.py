@@ -4,7 +4,11 @@ from unittest import mock
 import updater
 
 
-def release(tag, assets=("TTSReader-Setup.exe", "TTSReader-Setup.exe.sha256")):
+NEW_ASSETS = ("LocalReader-Setup.exe", "LocalReader-Setup.exe.sha256")
+LEGACY_ASSETS = ("TTSReader-Setup.exe", "TTSReader-Setup.exe.sha256")
+
+
+def release(tag, assets=NEW_ASSETS + LEGACY_ASSETS):
     return {
         "tag_name": tag,
         "body": "notas",
@@ -44,7 +48,16 @@ class CheckForUpdateTests(unittest.TestCase):
             info = updater.check_for_update("u/r", "1.0.0")
         self.assertEqual(info.version, "1.1.0")
         self.assertTrue(info.installable)
+        self.assertTrue(info.installer_url.endswith("/LocalReader-Setup.exe"))
+        self.assertTrue(info.checksum_url.endswith("/LocalReader-Setup.exe.sha256"))
+
+    def test_release_with_only_the_old_name_still_installs(self):
+        """Releases de quando o programa se chamava TTS Reader."""
+        with mock.patch.object(updater, "fetch_latest_release", return_value=release("v1.1.0", LEGACY_ASSETS)):
+            info = updater.check_for_update("u/r", "1.0.0")
+        self.assertTrue(info.installable)
         self.assertTrue(info.installer_url.endswith("/TTSReader-Setup.exe"))
+        self.assertTrue(info.checksum_url.endswith("/TTSReader-Setup.exe.sha256"))
 
     def test_release_without_installer_is_not_installable(self):
         with mock.patch.object(updater, "fetch_latest_release", return_value=release("v1.1.0", assets=())):
